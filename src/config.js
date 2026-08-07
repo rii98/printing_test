@@ -11,8 +11,28 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
+import { log } from './logger.js';
 
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
+
+/**
+ * Read a numeric env override safely. A typo like PRINT_HTTP_PORT=":4000" used to
+ * become NaN and silently bind a random port / a 0ms shutdown grace. Instead we
+ * accept only a valid integer in range, and otherwise KEEP the current value and
+ * warn loudly — a misconfiguration must never quietly change behaviour.
+ * @param {string} name  env var name
+ * @param {number} current  value to keep if the override is absent or invalid
+ * @param {(n:number)=>boolean} [ok]  range predicate
+ * @returns {number}
+ */
+function envInt(name, current, ok = (n) => n >= 0) {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === '') return current;
+  const n = Number(raw);
+  if (Number.isInteger(n) && ok(n)) return n;
+  log.warn(`ignoring ${name}=${JSON.stringify(raw)} — not a valid value; keeping ${current}`);
+  return current;
+}
 
 /** @returns {any} */
 function defaults() {
@@ -43,13 +63,13 @@ function loadFile() {
 }
 
 function applyEnv(cfg) {
-  if (process.env.PRINT_HTTP_PORT) cfg.http.port = Number(process.env.PRINT_HTTP_PORT);
+  cfg.http.port = envInt('PRINT_HTTP_PORT', cfg.http.port, (n) => n >= 0 && n <= 65535);
   if (process.env.PRINT_SHOP_NAME) cfg.shop.name = process.env.PRINT_SHOP_NAME;
   if (process.env.PRINT_STORE_DIR) cfg.store.dir = process.env.PRINT_STORE_DIR;
   if (process.env.PRINT_STORE_DIR === 'memory') cfg.store.dir = null;
   if (process.env.PRINT_DISCOVERY === 'off') cfg.discovery.enabled = false;
   if (process.env.PRINT_SUBNET) cfg.discovery.subnet = process.env.PRINT_SUBNET;
-  if (process.env.PRINT_SHUTDOWN_GRACE_MS) cfg.shutdown.graceMs = Number(process.env.PRINT_SHUTDOWN_GRACE_MS);
+  cfg.shutdown.graceMs = envInt('PRINT_SHUTDOWN_GRACE_MS', cfg.shutdown.graceMs, (n) => n >= 0);
   if (process.env.PRINT_API_KEY) cfg.auth.token = process.env.PRINT_API_KEY;
   return cfg;
 }
