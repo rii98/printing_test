@@ -46,8 +46,10 @@ test('transient failures retry, then succeed', async () => {
   assert.equal(events.filter((e) => e.type === 'retry').length, 2);
 });
 
-test('dead-letters after maxAttempts, keeps the job, moves on', async () => {
-  const store = memoryStore(); const t = fakeTransport({ online: false });
+test('a reachable printer that keeps rejecting dead-letters after maxAttempts', async () => {
+  // The printer is up (we connect) but rejects every transfer — a poison job.
+  // It must exhaust its budget and dead-letter so the line can move on.
+  const store = memoryStore(); const t = fakeTransport({ rejectWrites: true });
   const { q, events } = makeQueue(t, store);
   await q.enqueue({ id: 'dead1', bytes: bytesOf('x') });
   await q.onIdle();
@@ -57,6 +59,40 @@ test('dead-letters after maxAttempts, keeps the job, moves on', async () => {
   assert.ok(events.some((e) => e.type === 'offline'));
   assert.ok(events.some((e) => e.type === 'dead'));
   assert.equal(q.healthy, false);
+});
+
+test('M2: an outage never dead-letters — jobs are held and print when the printer returns', async () => {
+  const store = memoryStore();
+  const t = fakeTransport({ online: false });   // unreachable -> kind:'offline'
+  // Deterministically bring the printer back after several offline retries — well
+  // past maxAttempts (3), proving the outage did NOT consume the dead-letter budget.
+  let retries = 0;
+  const sleep = () => { if (++retries === 6) t.online = true; return Promise.resolve(); };
+  const { q, events } = makeQueue(t, store, { sleep });
+
+  await q.enqueue({ id: 'a', bytes: bytesOf('1') });
+  await q.enqueue({ id: 'b', bytes: bytesOf('2') });
+  await q.onIdle();
+
+  assert.deepEqual(t.sent.map((b) => b.toString()), ['1', '2'], 'both printed, in order, once back');
+  assert.equal(events.filter((e) => e.type === 'dead').length, 0, 'nothing dead-lettered during the outage');
+  assert.equal((await store.listDead()).length, 0);
+  assert.equal((await store.list()).length, 0, 'queue fully drained');
+  assert.ok(retries > 3, 'retried more times than maxAttempts without dead-lettering');
+  assert.ok(events.some((e) => e.type === 'offline'), 'reported OFFLINE');
+  assert.ok(events.some((e) => e.type === 'online'), 'reported back ONLINE');
+});
+
+test('M2 safety: an UNCLASSIFIED (untagged) failure still dead-letters, never loops forever', async () => {
+  // A fault with no kind (e.g. a corrupt payload) must be treated as a hard
+  // failure, not mistaken for an outage — otherwise it would block the queue.
+  const store = memoryStore();
+  const t = { describe: 'x', async send() { throw new Error('mystery failure'); }, async probe() { return false; } };
+  const { q, events } = makeQueue(t, store);         // maxAttempts: 3
+  await q.enqueue({ id: 'poison', bytes: bytesOf('x') });
+  await q.onIdle();                                    // must resolve, not hang
+  assert.equal((await store.listDead()).length, 1, 'dead-lettered after the cap');
+  assert.ok(events.some((e) => e.type === 'dead'));
 });
 
 test('durability: a job persisted before a crash is recovered and printed', async () => {

@@ -22,7 +22,9 @@ export function logEvent(evt) {
   switch (evt.type) {
     case 'sent': log.info(`printed ${evt.label || evt.jobId}`, { printer: evt.printerId, attempts: evt.attempts }); break;
     case 'queued': log.info(`queued ${evt.label || evt.jobId}`, { printer: evt.printerId }); break;
-    case 'retry': log.warn(`retry ${evt.jobId}`, { printer: evt.printerId, attempts: evt.attempts, delay: evt.delay, error: evt.error }); break;
+    // During an outage the printer is already logged OFFLINE once; the periodic
+    // reconnect attempts add no information, so don't spam a line per retry.
+    case 'retry': if (!evt.offline) log.warn(`retry ${evt.jobId}`, { printer: evt.printerId, attempts: evt.attempts, delay: evt.delay, error: evt.error }); break;
     case 'offline': log.warn(`printer OFFLINE`, { printer: evt.printerId, error: evt.error }); break;
     case 'online': log.info(`printer back ONLINE`, { printer: evt.printerId }); break;
     case 'dead': log.error(`DEAD-LETTER ${evt.jobId} (kept for reprint)`, { printer: evt.printerId, attempts: evt.attempts, error: evt.error }); break;

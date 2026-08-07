@@ -149,15 +149,25 @@ export class PrinterQueue {
 
         job.attempts += 1;
         const error = String(sendErr?.message || sendErr);
+        // An 'offline' failure means we never reached the printer — a shared
+        // outage (unplugged, rebooting, network down) that hits EVERY job equally,
+        // not a fault of this one. Counting it toward dead-lettering would quietly
+        // discard receipts during a blip, so offline failures retry indefinitely
+        // with capped backoff and hold the whole queue in order. Only a failure
+        // while the printer is reachable — or any unclassified fault (e.g. a corrupt
+        // payload) — increments the dead-letter budget, which keeps the line moving
+        // past a genuine poison job. This is the fix for the outage dead-letter storm.
+        const offline = sendErr?.kind === 'offline';
+        if (!offline) job.hardFailures = (job.hardFailures ?? 0) + 1;
         if (this.healthy) { this.healthy = false; this._emit({ type: 'offline', printerId: this.printerId, error }); }
-        if (job.attempts >= this.policy.maxAttempts) {
+        if (!offline && job.hardFailures >= this.policy.maxAttempts) {
           this.jobs.shift();
           await this._safely(() => this.store.kill(job), 'kill', job.id);
-          this._emit({ type: 'dead', printerId: this.printerId, jobId: job.id, label: job.label, attempts: job.attempts, error });
+          this._emit({ type: 'dead', printerId: this.printerId, jobId: job.id, label: job.label, attempts: job.attempts, hardFailures: job.hardFailures, error });
         } else {
           await this._safely(() => this.store.update(job), 'update', job.id);
           const delay = backoff(job.attempts, this.policy);
-          this._emit({ type: 'retry', printerId: this.printerId, jobId: job.id, attempts: job.attempts, delay, error });
+          this._emit({ type: 'retry', printerId: this.printerId, jobId: job.id, attempts: job.attempts, delay, error, offline });
           await this.sleep(delay);
         }
       }

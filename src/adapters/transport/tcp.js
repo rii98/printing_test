@@ -17,27 +17,41 @@ import net from 'node:net';
  * @returns {Transport}
  */
 export function tcpTransport({ host, port = 9100, connectTimeoutMs = 4000, writeTimeoutMs = 8000 }) {
+  // Failures are tagged so the queue can tell a shared outage from a job fault:
+  //   • kind:'offline' — we never reached the printer (refused/unreachable/connect
+  //     timeout). This hits every job equally, so it must NOT count toward
+  //     dead-lettering; the queue retries indefinitely and loses nothing.
+  //   • kind:'io'      — we connected but the transfer failed (write error/timeout).
+  //     This may be job-specific (a payload the printer chokes on), so it counts
+  //     toward the dead-letter cap to keep the line moving.
   const send = (bytes) => new Promise((resolve, reject) => {
     const socket = new net.Socket();
-    let settled = false;
-    const done = (err) => {
+    let settled = false, connected = false, connectGuard;
+    const fail = (msg, kind) => {
       if (settled) return; settled = true;
+      clearTimeout(connectGuard);
       socket.destroy();
-      err ? reject(err) : resolve();
+      const err = new Error(msg); err.kind = kind; reject(err);
     };
-    socket.setTimeout(writeTimeoutMs, () => done(new Error(`write timeout to ${host}:${port}`)));
-    socket.once('error', done);
+    const ok = () => {
+      if (settled) return; settled = true;
+      clearTimeout(connectGuard);
+      socket.destroy();
+      resolve();
+    };
+    // Inactivity timeout: before connect it's an outage, after connect it's I/O.
+    socket.setTimeout(writeTimeoutMs, () => fail(`timeout to ${host}:${port}`, connected ? 'io' : 'offline'));
+    socket.once('error', (e) => fail(`${e.code || e.message} to ${host}:${port}`, connected ? 'io' : 'offline'));
     socket.connect({ host, port }, () => {
+      connected = true;
       socket.write(bytes, (err) => {
-        if (err) return done(err);
+        if (err) return fail(`write failed to ${host}:${port}: ${err.message}`, 'io');
         // Give the printer a beat to drain, then close cleanly.
-        socket.end(() => done());
+        socket.end(() => ok());
       });
     });
     // Guard the connect phase separately (connect has no own timeout by default).
-    const connectGuard = setTimeout(() => done(new Error(`connect timeout to ${host}:${port}`)), connectTimeoutMs);
-    socket.once('connect', () => clearTimeout(connectGuard));
-    socket.once('close', () => clearTimeout(connectGuard));
+    connectGuard = setTimeout(() => fail(`connect timeout to ${host}:${port}`, 'offline'), connectTimeoutMs);
   });
 
   const probe = () => new Promise((resolve) => {
