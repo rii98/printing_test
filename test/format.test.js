@@ -39,3 +39,24 @@ test('center and rule respect width', () => {
   assert.equal(center('hi', 6), '  hi');
   assert.equal(rule(5, '='), '=====');
 });
+
+test('H2: text helpers are total — degenerate widths never hang or throw', () => {
+  // On the old code wrap(_, 0) looped forever (i += 0) until the process died.
+  // A width of 0 is reachable via double-width math on a tiny column, or misconfig.
+  for (const badWidth of [0, -5, NaN, undefined, 1.5, '48', Infinity]) {
+    assert.doesNotThrow(() => {
+      const lines = wrap('supercalifragilistic expialidocious', badWidth);
+      assert.ok(Array.isArray(lines) && lines.length >= 1);
+      for (const l of lines) assert.ok(l.length >= 1, 'no empty hard-slice fragments');
+      center('hello world', badWidth);
+      leftRight('Subtotal', '12.50', badWidth);
+      rule(badWidth, '-');
+    }, `width=${String(badWidth)} must be handled, not fatal`);
+  }
+});
+
+test('H2: valid widths are unchanged by the guard', () => {
+  assert.deepEqual(wrap('the quick brown fox', 9), ['the quick', 'brown fox']);
+  assert.deepEqual(wrap('supercalifragilistic', 8), ['supercal', 'ifragili', 'stic']);
+  assert.equal(rule(5, '='), '=====');
+});
