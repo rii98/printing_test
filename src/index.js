@@ -6,6 +6,7 @@ import os from 'node:os';
 import { loadConfig } from './config.js';
 import { buildService } from './bootstrap.js';
 import { createHttpApp } from './inbound/http.js';
+import { createGracefulShutdown } from './shutdown.js';
 import { log } from './logger.js';
 
 const cfg = loadConfig();
@@ -18,12 +19,11 @@ const server = app.listen(cfg.http.port, '0.0.0.0', () => {
     if (a && a.family === 'IPv4' && !a.internal) log.info(`  devices POST -> http://${a.address}:${cfg.http.port}/print`);
 });
 
-async function shutdown(sig) {
-  log.info(`${sig} received — draining queues…`);
-  server.close();
-  await Promise.all([...printers.values()].map((p) => p.queue.onIdle()));
-  log.info('drained. bye.');
-  process.exit(0);
-}
+const shutdown = createGracefulShutdown({
+  server,
+  queues: [...printers.values()].map((p) => p.queue),
+  graceMs: cfg.shutdown.graceMs,
+  log,
+});
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
