@@ -66,6 +66,52 @@ test('/print-batch is guarded too', async () => {
   });
 });
 
+test('malformed JSON body returns uniform JSON error, not an HTML stack page', async () => {
+  const svc = stubService();
+  await withServer(createHttpApp(svc, {}), async (base) => {
+    const res = await fetch(base + '/print', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{ this is not valid json',
+    });
+    assert.equal(res.status, 400);
+    assert.match(res.headers.get('content-type') || '', /application\/json/);
+    const body = await res.json();
+    assert.equal(body.status, 'error');
+    assert.equal(body.error, 'invalid JSON body');
+    assert.doesNotMatch(body.error, /SyntaxError|at |stack/i, 'no internals leaked');
+    assert.equal(svc.calls.length, 0, 'a body that never parsed never reaches the service');
+  });
+});
+
+test('oversized body is rejected as JSON (413), service untouched', async () => {
+  const svc = stubService();
+  // 1 KB cap so the test payload stays tiny; production uses 512 KB.
+  await withServer(createHttpApp(svc, { bodyLimit: '1kb' }), async (base) => {
+    const huge = { id: 'x', station: 'kitchen', items: [{ name: 'A'.repeat(4000), qty: 1 }] };
+    const res = await post(base, '/print', huge);
+    assert.equal(res.status, 413);
+    const body = await res.json();
+    assert.equal(body.status, 'error');
+    assert.equal(body.error, 'payload too large');
+    assert.equal(svc.calls.length, 0);
+  });
+});
+
+test('an unexpected service rejection becomes a 500 JSON, not a hung request', async () => {
+  // Even though the core service is written not to throw, the adapter must never
+  // hang if it ever does — a rejected async handler has to land as JSON.
+  const svc = { async print() { throw new Error('boom: secret internal detail'); }, health: () => ({ printers: {} }) };
+  await withServer(createHttpApp(svc, {}), async (base) => {
+    const res = await post(base, '/print', ticket);
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.equal(body.status, 'error');
+    assert.equal(body.error, 'internal error', 'server faults stay opaque');
+    assert.doesNotMatch(JSON.stringify(body), /secret internal detail/, 'no internals leaked');
+  });
+});
+
 test('/health stays open for probes even with a key set', async () => {
   await withServer(createHttpApp(stubService(), { apiKey: 'k', shopName: 'X' }), async (base) => {
     const res = await fetch(base + '/health');

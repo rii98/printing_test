@@ -16,6 +16,11 @@ const bearer = (req) => {
   return m ? m[1].trim() : null;
 };
 
+// Express 4 does not forward a rejected async handler to the error middleware —
+// the request would hang until the client times out. This adapter routes any
+// rejection into next(err) so the terminal handler below turns it into JSON.
+const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 /**
  * Middleware guarding the mutating routes with a shared secret, supplied as
  * `Authorization: Bearer <key>` or `X-Api-Key: <key>`. With no key configured it
@@ -33,31 +38,51 @@ export function requireApiKey(apiKey) {
 
 /**
  * @param {import('../core/service.js').PrintService} service
- * @param {{shopName?:string, apiKey?:string|null}} [meta]
+ * @param {{shopName?:string, apiKey?:string|null, bodyLimit?:string}} [meta]
+ *   bodyLimit — max accepted request body (default 512kb); injectable for tests.
  */
-export function createHttpApp(service, { shopName, apiKey } = {}) {
+export function createHttpApp(service, { shopName, apiKey, bodyLimit = '512kb' } = {}) {
   const app = express();
-  app.use(express.json({ limit: '512kb' }));
+  app.use(express.json({ limit: bodyLimit }));
   const auth = requireApiKey(apiKey);
 
   // Liveness + per-printer health/queue depth. Left open for probes/monitors.
   app.get('/health', (req, res) => res.json({ ok: true, shop: shopName, ...service.health() }));
 
   // Print one ticket. Body = neutral Ticket (see src/core/domain.js).
-  app.post('/print', auth, async (req, res) => {
+  app.post('/print', auth, asyncRoute(async (req, res) => {
     const result = await service.print(req.body);
     const code = result.status === 'error' ? 400 : 200;
     res.status(code).json(result);
-  });
+  }));
 
   // Print many at once (e.g. an order that fans out to several stations).
-  app.post('/print-batch', auth, async (req, res) => {
+  app.post('/print-batch', auth, asyncRoute(async (req, res) => {
     const list = Array.isArray(req.body) ? req.body : [];
     const results = [];
     for (const t of list) results.push(await service.print(t));
     res.json({ results });
-  });
+  }));
 
   app.get('/', (req, res) => res.json({ service: 'print-agent', endpoints: ['/health', 'POST /print', 'POST /print-batch'] }));
+
+  // Terminal error handler. Two jobs: keep EVERY failure a uniform JSON envelope
+  // (never Express's default HTML stack page — that both breaks JSON clients and
+  // leaks internals), and translate the body parser's typed faults into precise,
+  // safe client errors. Anything else stays an opaque 500. Must be registered
+  // last, and must keep the 4-arg signature so Express treats it as error mware.
+  // eslint-disable-next-line no-unused-vars
+  app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+    const clientReasons = {
+      'entity.parse.failed': 'invalid JSON body',
+      'entity.too.large': 'payload too large',
+      'charset.unsupported': 'unsupported charset',
+      'encoding.unsupported': 'unsupported content encoding',
+    };
+    const error = status >= 500 ? 'internal error' : (clientReasons[err?.type] ?? 'bad request');
+    res.status(status).json({ status: 'error', error });
+  });
   return app;
 }
