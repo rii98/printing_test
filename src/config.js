@@ -19,6 +19,7 @@ function defaults() {
   return {
     shop: { name: 'NAMASTE MINI MARKET', lines: [] },
     http: { port: 4000 },
+    auth: { token: null },   // shared secret for /print; null = open (dev only)
     store: { dir: path.join(ROOT, '.queue') },   // durable; set to null for in-memory
     policy: { maxAttempts: 8, baseDelayMs: 500, maxDelayMs: 30_000 },
     discovery: { enabled: true, subnet: null },
@@ -49,6 +50,7 @@ function applyEnv(cfg) {
   if (process.env.PRINT_DISCOVERY === 'off') cfg.discovery.enabled = false;
   if (process.env.PRINT_SUBNET) cfg.discovery.subnet = process.env.PRINT_SUBNET;
   if (process.env.PRINT_SHUTDOWN_GRACE_MS) cfg.shutdown.graceMs = Number(process.env.PRINT_SHUTDOWN_GRACE_MS);
+  if (process.env.PRINT_API_KEY) cfg.auth.token = process.env.PRINT_API_KEY;
   return cfg;
 }
 
@@ -57,6 +59,7 @@ function merge(base, over) {
   const out = { ...base, ...over };
   out.shop = { ...base.shop, ...over.shop };
   out.http = { ...base.http, ...over.http };
+  out.auth = { ...base.auth, ...over.auth };
   out.store = { ...base.store, ...over.store };
   out.policy = { ...base.policy, ...over.policy };
   out.discovery = { ...base.discovery, ...over.discovery };

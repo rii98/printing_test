@@ -11,7 +11,9 @@ import { log } from './logger.js';
 
 const cfg = loadConfig();
 const { service, printers } = await buildService(cfg);
-const app = createHttpApp(service, { shopName: cfg.shop.name });
+const app = createHttpApp(service, { shopName: cfg.shop.name, apiKey: cfg.auth.token });
+
+if (!cfg.auth.token) log.warn('AUTH DISABLED — /print is open to anyone on the network. Set PRINT_API_KEY to require a token.');
 
 const server = app.listen(cfg.http.port, '0.0.0.0', () => {
   log.info(`print-agent listening on :${cfg.http.port}`, { store: cfg.store?.dir ?? 'memory' });
