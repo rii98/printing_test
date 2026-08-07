@@ -5,21 +5,35 @@
  */
 import { DocBuilder } from '../doc.js';
 import { money } from '../format.js';
+import { toMinor, fromMinor, applyRate } from '../../money.js';
 
 const fmtTime = (v) => { try { return v ? new Date(v).toLocaleString() : ''; } catch { return ''; } };
 
-/** Compute the money breakdown. Pure — unit-tested independently. */
+/** A single line's charge, rounded to the minor unit exactly once. */
+const lineMinor = (it) => toMinor((it.price ?? 0) * (it.qty ?? 1));
+
+/**
+ * Compute the money breakdown. Pure — unit-tested independently. All arithmetic
+ * runs in integer minor units so the printed lines reconcile with the subtotal
+ * and total to the paisa; the returned numbers are major units (unchanged shape).
+ */
 export function computeTotals(t) {
   const cur = t.currency ?? '';
-  const subtotal = t.items.filter((i) => !i.voided)
-    .reduce((s, i) => s + (i.price ?? 0) * i.qty, 0);
-  const discount = t.discount ?? 0;
-  const service = t.serviceCharge ?? 0;
-  const taxed = Math.max(0, subtotal - discount) + service;
-  const tax = t.taxRate ? taxed * t.taxRate : 0;
-  const computed = taxed + tax;
-  const total = t.total != null ? t.total : computed;
-  return { cur, subtotal, discount, service, tax, total };
+  const subtotalMinor = t.items.filter((i) => !i.voided).reduce((s, i) => s + lineMinor(i), 0);
+  const discountMinor = toMinor(t.discount ?? 0);
+  const serviceMinor = toMinor(t.serviceCharge ?? 0);
+  const taxedMinor = Math.max(0, subtotalMinor - discountMinor) + serviceMinor;
+  const taxMinor = t.taxRate ? applyRate(taxedMinor, t.taxRate) : 0;
+  const computedMinor = taxedMinor + taxMinor;
+  const totalMinor = t.total != null ? toMinor(t.total) : computedMinor;
+  return {
+    cur,
+    subtotal: fromMinor(subtotalMinor),
+    discount: fromMinor(discountMinor),
+    service: fromMinor(serviceMinor),
+    tax: fromMinor(taxMinor),
+    total: fromMinor(totalMinor),
+  };
 }
 
 /**
@@ -40,7 +54,9 @@ export function billReceipt(t, { shopName = 'RECEIPT', shopLines = [] } = {}) {
   b.align('left');
   for (const it of t.items) {
     if (it.voided) continue;
-    const lineTotal = money((it.price ?? 0) * it.qty, cur);
+    // Format the SAME rounded minor-unit value that fed the subtotal, so the
+    // column of line totals always sums to the printed subtotal.
+    const lineTotal = money(fromMinor(lineMinor(it)), cur);
     b.row(`${it.qty}x ${it.name}`, lineTotal);
     for (const m of it.modifiers ?? []) b.text(`   - ${m}`);
   }

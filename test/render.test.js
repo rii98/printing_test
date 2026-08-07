@@ -49,6 +49,22 @@ test('explicit total overrides computed', () => {
   assert.equal(computeTotals(bill).total, 999);
 });
 
+test('H4: printed line items sum exactly to the printed subtotal', () => {
+  // On the old float code these three 0.125 lines each printed 0.13 while the
+  // subtotal summed the raw floats and printed 0.25 — a receipt that didn't add up.
+  const bill = normalizeTicket({
+    id: 'r1', station: 'cashier', currency: 'Rs',
+    items: [{ name: 'Tea', qty: 1, price: 0.125 }, { name: 'Tea', qty: 1, price: 0.125 }, { name: 'Tea', qty: 1, price: 0.125 }],
+  });
+  const txt = toText(renderTicket(bill));
+  const lineTotals = [...txt.matchAll(/Rs (\d+\.\d\d)/g)].map((m) => Number(m[1]));
+  const subtotalLine = txt.split('\n').find((l) => /Subtotal/i.test(l));
+  const subtotal = Number(subtotalLine.match(/(\d+\.\d\d)/)[1]);
+  // First three matches are the item lines; they must sum to the subtotal.
+  const sumOfItems = lineTotals.slice(0, 3).reduce((a, b) => a + b, 0);
+  assert.equal(sumOfItems.toFixed(2), subtotal.toFixed(2), `items ${sumOfItems} != subtotal ${subtotal}`);
+});
+
 test('voided ticket renders a VOID slip regardless of station', () => {
   const v = normalizeTicket({ id: 'o1', revision: 2, station: 'kitchen', voided: true, voidReason: 'wrong table', items: [{ name: 'Momo', qty: 2 }] });
   const txt = toText(renderTicket(v));
