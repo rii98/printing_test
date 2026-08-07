@@ -10,6 +10,8 @@ import { PrintService } from './core/service.js';
 import { tcpTransport } from './adapters/transport/tcp.js';
 import { fileStore } from './adapters/store/file.js';
 import { memoryStore } from './adapters/store/memory.js';
+import { fileIdempotency } from './adapters/store/idempotency-file.js';
+import { memoryIdempotency } from './core/idempotency.js';
 import { discoverPrinters, normalizeMac } from './adapters/discovery/scan.js';
 import { logEvent, log } from './logger.js';
 
@@ -19,6 +21,8 @@ import { logEvent, log } from './logger.js';
  */
 export async function buildService(cfg, { onEvent = logEvent } = {}) {
   const store = cfg.store?.dir ? await fileStore(cfg.store.dir) : memoryStore();
+  // Idempotency matches the store's durability: durable on disk, or in-memory.
+  const idempotency = cfg.store?.dir ? await fileIdempotency(cfg.store.dir) : memoryIdempotency();
 
   // Resolve addresses: if any printer is MAC-configured and discovery is on, scan.
   let macToIp = new Map();
@@ -43,11 +47,19 @@ export async function buildService(cfg, { onEvent = logEvent } = {}) {
     log.info(`printer "${id}" -> ${transport.describe}`, { station: p.station, source: p.mac && macToIp.get(normalizeMac(p.mac)) ? 'discovered' : 'configured' });
   }
 
+  // Hydrate idempotency from jobs that outlived the last run: a still-pending or
+  // dead-lettered job was already accepted, so a re-send of the same key after a
+  // restart must be recognized as a duplicate. This closes the narrow window
+  // between enqueue() and commit() where a crash could otherwise let it reprint.
+  const known = [...(await store.list()), ...(await store.listDead())].map((j) => j.key ?? j.id);
+  if (known.length) await idempotency.seed(known);
+
   const service = new PrintService({
     printers,
     stationToPrinter: cfg.stationToPrinter,
     branding: { shopName: cfg.shop.name, shopLines: cfg.shop.lines },
+    idempotency,
     onEvent,
   });
-  return { service, printers, store };
+  return { service, printers, store, idempotency };
 }

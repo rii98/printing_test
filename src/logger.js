@@ -27,6 +27,7 @@ export function logEvent(evt) {
     case 'online': log.info(`printer back ONLINE`, { printer: evt.printerId }); break;
     case 'dead': log.error(`DEAD-LETTER ${evt.jobId} (kept for reprint)`, { printer: evt.printerId, attempts: evt.attempts, error: evt.error }); break;
     case 'recovered': log.info(`recovered ${evt.count} job(s) after restart`, { printer: evt.printerId }); break;
+    case 'store-error': log.error(`STORE ERROR during ${evt.op} (job kept safe; may reprint on restart)`, { printer: evt.printerId, jobId: evt.jobId, error: evt.error }); break;
     case 'duplicate': log.info(`skipped duplicate`, { key: evt.key }); break;
     case 'rejected': log.warn(`rejected invalid ticket`, { error: evt.error }); break;
     default: break;

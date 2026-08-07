@@ -48,12 +48,40 @@ export class PrinterQueue {
     this._idleWaiters = [];
   }
 
+  /** Emit an event without ever letting a throwing consumer break the drain loop. */
+  _emit(evt) {
+    try { this.onEvent(evt); } catch { /* an observer's failure is not a print failure */ }
+  }
+
+  /**
+   * Run a durable-bookkeeping op that must NOT be able to trigger a re-print.
+   * A store failure here is retried a few times (a transient blip — brief EIO,
+   * a momentary lock — must not leave a ghost pending record that reprints on
+   * the next restart), then reported and swallowed rather than rethrown into the
+   * drain loop, because the delivery decision has already been made. Only a
+   * *persistent* store failure gives up; the worst case then is a reprint on the
+   * next restart, which is the safe direction — a duplicate over a lost receipt —
+   * and it is surfaced loudly for operators.
+   */
+  async _safely(fn, op, jobId, attempts = 3) {
+    for (let i = 1; i <= attempts; i++) {
+      try { await fn(); return; }
+      catch (err) {
+        if (i === attempts) {
+          this._emit({ type: 'store-error', printerId: this.printerId, jobId, op, error: String(err.message || err) });
+          return;
+        }
+        await this.sleep(Math.min(1000, 50 * i));
+      }
+    }
+  }
+
   /** Load persisted jobs after a restart and resume draining. */
   async recover() {
     const persisted = (await this.store.list()).filter((j) => j.printerId === this.printerId);
     this.jobs.push(...persisted);
-    if (persisted.length) this.onEvent({ type: 'recovered', printerId: this.printerId, count: persisted.length });
-    this._drain();
+    if (persisted.length) this._emit({ type: 'recovered', printerId: this.printerId, count: persisted.length });
+    this._kick();
   }
 
   /**
@@ -72,8 +100,8 @@ export class PrinterQueue {
     };
     await this.store.add(record);          // durable BEFORE ack
     this.jobs.push(record);
-    this.onEvent({ type: 'queued', printerId: this.printerId, jobId: record.id, label: record.label });
-    this._drain();
+    this._emit({ type: 'queued', printerId: this.printerId, jobId: record.id, label: record.label });
+    this._kick();
   }
 
   get depth() { return this.jobs.length; }
@@ -84,32 +112,53 @@ export class PrinterQueue {
     return new Promise((resolve) => this._idleWaiters.push(resolve));
   }
 
+  /** Fire-and-forget drain trigger. Defensive: the loop is written not to throw,
+   *  but if it ever did, an unhandled rejection must not take down the process. */
+  _kick() {
+    this._drain().catch((err) =>
+      this._emit({ type: 'store-error', printerId: this.printerId, op: 'drain', error: String(err.message || err) }));
+  }
+
   async _drain() {
     if (this.draining) return;
     this.draining = true;
     try {
       while (this.jobs.length) {
         const job = this.jobs[0];
-        const bytes = Buffer.from(job.bytes, 'base64');
+
+        // --- Phase 1: delivery. This is the ONLY retryable, side-effecting step.
+        // Decoding bytes is part of "can we deliver this?", so a corrupt payload
+        // fails here and eventually dead-letters instead of crashing the loop.
+        let sent = false, sendErr;
         try {
-          await this.transport.send(bytes);
-          this.jobs.shift();
-          await this.store.remove(job.id);
-          if (!this.healthy) { this.healthy = true; this.onEvent({ type: 'online', printerId: this.printerId }); }
-          this.onEvent({ type: 'sent', printerId: this.printerId, jobId: job.id, label: job.label, attempts: job.attempts + 1 });
+          await this.transport.send(Buffer.from(job.bytes, 'base64'));
+          sent = true;
         } catch (err) {
-          job.attempts += 1;
-          if (this.healthy) { this.healthy = false; this.onEvent({ type: 'offline', printerId: this.printerId, error: String(err.message || err) }); }
-          if (job.attempts >= this.policy.maxAttempts) {
-            this.jobs.shift();
-            await this.store.kill(job);
-            this.onEvent({ type: 'dead', printerId: this.printerId, jobId: job.id, label: job.label, attempts: job.attempts, error: String(err.message || err) });
-          } else {
-            await this.store.update(job);
-            const delay = backoff(job.attempts, this.policy);
-            this.onEvent({ type: 'retry', printerId: this.printerId, jobId: job.id, attempts: job.attempts, delay, error: String(err.message || err) });
-            await this.sleep(delay);
-          }
+          sendErr = err;
+        }
+
+        // --- Phase 2: record the outcome. Nothing here may cause a re-send, and
+        // no failure here may escape the loop (see _safely / _emit).
+        if (sent) {
+          this.jobs.shift();
+          await this._safely(() => this.store.remove(job.id), 'remove', job.id);
+          if (!this.healthy) { this.healthy = true; this._emit({ type: 'online', printerId: this.printerId }); }
+          this._emit({ type: 'sent', printerId: this.printerId, jobId: job.id, label: job.label, attempts: job.attempts + 1 });
+          continue;
+        }
+
+        job.attempts += 1;
+        const error = String(sendErr?.message || sendErr);
+        if (this.healthy) { this.healthy = false; this._emit({ type: 'offline', printerId: this.printerId, error }); }
+        if (job.attempts >= this.policy.maxAttempts) {
+          this.jobs.shift();
+          await this._safely(() => this.store.kill(job), 'kill', job.id);
+          this._emit({ type: 'dead', printerId: this.printerId, jobId: job.id, label: job.label, attempts: job.attempts, error });
+        } else {
+          await this._safely(() => this.store.update(job), 'update', job.id);
+          const delay = backoff(job.attempts, this.policy);
+          this._emit({ type: 'retry', printerId: this.printerId, jobId: job.id, attempts: job.attempts, delay, error });
+          await this.sleep(delay);
         }
       }
     } finally {

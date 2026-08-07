@@ -11,16 +11,7 @@
 import { normalizeTicket, ticketKey, STATION_DOC } from './domain.js';
 import { renderTicket } from './render/index.js';
 import { encode } from './render/escpos.js';
-
-/** A tiny in-memory idempotency set. Swap for a persisted one if desired. */
-export function memoryDedup(limit = 5000) {
-  const seen = new Set();
-  const order = [];
-  return {
-    has: (k) => seen.has(k),
-    add: (k) => { if (!seen.has(k)) { seen.add(k); order.push(k); if (order.length > limit) seen.delete(order.shift()); } },
-  };
-}
+import { memoryIdempotency } from './idempotency.js';
 
 export class PrintService {
   /**
@@ -28,14 +19,14 @@ export class PrintService {
    * @param {Map<string, {queue:import('./queue.js').PrinterQueue, width:number, encoding?:string, cut?:boolean, docKind?:string}>} o.printers  keyed by printerId
    * @param {Record<string,string>} o.stationToPrinter  station -> printerId
    * @param {{shopName?:string, shopLines?:string[]}} [o.branding]
-   * @param {{has:(k:string)=>boolean, add:(k:string)=>void}} [o.dedup]
+   * @param {import('./idempotency.js').Idempotency} [o.idempotency]
    * @param {(evt:any)=>void} [o.onEvent]
    */
-  constructor({ printers, stationToPrinter, branding = {}, dedup = memoryDedup(), onEvent = () => {} }) {
+  constructor({ printers, stationToPrinter, branding = {}, idempotency = memoryIdempotency(), onEvent = () => {} }) {
     this.printers = printers;
     this.stationToPrinter = stationToPrinter;
     this.branding = branding;
-    this.dedup = dedup;
+    this.idem = idempotency;
     this.onEvent = onEvent;
   }
 
@@ -52,12 +43,8 @@ export class PrintService {
       return { status: 'error', error: String(err.message || err) };
     }
 
-    const key = ticketKey(ticket);
-    if (this.dedup.has(key)) {
-      this.onEvent({ type: 'duplicate', key });
-      return { status: 'duplicate', ticket: key };
-    }
-
+    // Resolve the target before reserving, so a misrouted ticket never consumes
+    // an idempotency slot (and can be legitimately re-sent once routing is fixed).
     const printerId = this.stationToPrinter[ticket.station];
     const printer = printerId && this.printers.get(printerId);
     if (!printer) {
@@ -66,12 +53,30 @@ export class PrintService {
       return { status: 'error', error };
     }
 
+    // Atomic gate: reserve() decides in one synchronous tick, so two concurrent
+    // identical requests can never both pass. Everything from here to enqueue()
+    // is synchronous — no await can interleave a second request in between.
+    const key = ticketKey(ticket);
+    if (!this.idem.reserve(key)) {
+      this.onEvent({ type: 'duplicate', key });
+      return { status: 'duplicate', ticket: key };
+    }
+
     const docKind = printer.docKind ?? STATION_DOC[ticket.station];
     const doc = renderTicket(ticket, { docKind, branding: this.branding });
     const bytes = encode(doc, { width: printer.width, encoding: printer.encoding ?? 'latin1', cut: printer.cut !== false, cutFeed: printer.cutFeed });
 
-    await printer.queue.enqueue({ id: key, key, bytes, label: `${ticket.station}#${ticket.number ?? ''}` });
-    this.dedup.add(key);
+    try {
+      await printer.queue.enqueue({ id: key, key, bytes, label: `${ticket.station}#${ticket.number ?? ''}` });
+    } catch (err) {
+      // The ticket was never durably accepted — free the key so a retry can print.
+      await this.idem.rollback(key);
+      const error = String(err.message || err);
+      this.onEvent({ type: 'error', error });
+      return { status: 'error', error };
+    }
+    // Durably remember the key (no-op for the in-memory implementation).
+    await this.idem.commit(key);
     return { status: 'queued', ticket: key, printer: printerId };
   }
 

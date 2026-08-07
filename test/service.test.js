@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PrintService, memoryDedup } from '../src/core/service.js';
+import { PrintService } from '../src/core/service.js';
+import { memoryIdempotency } from '../src/core/idempotency.js';
 import { PrinterQueue } from '../src/core/queue.js';
 import { memoryStore } from '../src/adapters/store/memory.js';
 import { fakeTransport } from '../src/adapters/transport/fake.js';
@@ -16,7 +17,7 @@ function buildService() {
     printers,
     stationToPrinter: { cashier: 'cashier', kitchen: 'kitchen' },
     branding: { shopName: 'TEST' },
-    dedup: memoryDedup(),
+    idempotency: memoryIdempotency(),
   });
   return { service, transports, printers };
 }
@@ -40,6 +41,39 @@ test('idempotent: same id@revision prints once', async () => {
   assert.equal(b.status, 'duplicate');
   await printers.get('kitchen').queue.onIdle();
   assert.equal(transports.kitchen.sent.length, 1);
+});
+
+test('concurrent identical requests print exactly once (C1 race)', async () => {
+  const { service, printers, transports } = buildService();
+  const ticket = { id: 'race1', station: 'kitchen', items: [{ name: 'Momo', qty: 1 }] };
+  // Fire many identical requests at once — an SSE replay / POS retry storm.
+  const results = await Promise.all(Array.from({ length: 25 }, () => service.print({ ...ticket })));
+  await printers.get('kitchen').queue.onIdle();
+  const queued = results.filter((r) => r.status === 'queued').length;
+  const duplicate = results.filter((r) => r.status === 'duplicate').length;
+  assert.equal(queued, 1, 'exactly one request is accepted');
+  assert.equal(duplicate, 24, 'the rest are recognized as duplicates');
+  assert.equal(transports.kitchen.sent.length, 1, 'exactly one receipt on paper');
+});
+
+test('a failed enqueue rolls back the reservation so a retry can print', async () => {
+  let fail = true;
+  const queue = {
+    healthy: true, depth: 0, transport: { describe: 'fake' },
+    async enqueue(job) { if (fail) { fail = false; throw new Error('store add failed'); } this.transport.sent.push(job); },
+  };
+  queue.transport.sent = [];
+  const service = new PrintService({
+    printers: new Map([['kitchen', { queue, width: 48, docKind: 'kot' }]]),
+    stationToPrinter: { kitchen: 'kitchen' },
+    idempotency: memoryIdempotency(),
+  });
+  const ticket = { id: 'rb1', station: 'kitchen', items: [{ name: 'Tea', qty: 1 }] };
+  const first = await service.print({ ...ticket });
+  assert.equal(first.status, 'error', 'first attempt surfaces the enqueue failure');
+  const second = await service.print({ ...ticket });   // same key, must NOT be swallowed as duplicate
+  assert.equal(second.status, 'queued', 'retry of a never-accepted ticket goes through');
+  assert.equal(queue.transport.sent.length, 1);
 });
 
 test('a new revision prints again', async () => {
