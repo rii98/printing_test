@@ -112,6 +112,52 @@ test('an unexpected service rejection becomes a 500 JSON, not a hung request', a
   });
 });
 
+// A service whose verdict depends on the ticket id, to exercise batch aggregation.
+const verdictService = (verdict) => ({
+  async print(t) {
+    const status = verdict(t);
+    return status === 'error' ? { status: 'error', error: 'nope' } : { status, ticket: t?.id };
+  },
+  health: () => ({ printers: {} }),
+});
+
+test('/print-batch: all accepted -> 200', async () => {
+  const svc = verdictService(() => 'queued');
+  await withServer(createHttpApp(svc, {}), async (base) => {
+    const res = await post(base, '/print-batch', [ticket, ticket]);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).results.length, 2);
+  });
+});
+
+test('/print-batch: partial failure -> 207 Multi-Status', async () => {
+  const svc = verdictService((t) => (t.id === 'bad' ? 'error' : 'queued'));
+  await withServer(createHttpApp(svc, {}), async (base) => {
+    const res = await post(base, '/print-batch', [{ ...ticket, id: 'ok' }, { ...ticket, id: 'bad' }]);
+    assert.equal(res.status, 207);
+    const body = await res.json();
+    assert.deepEqual(body.results.map((r) => r.status), ['queued', 'error']);
+  });
+});
+
+test('/print-batch: every item failed -> 400', async () => {
+  const svc = verdictService(() => 'error');
+  await withServer(createHttpApp(svc, {}), async (base) => {
+    const res = await post(base, '/print-batch', [ticket, ticket]);
+    assert.equal(res.status, 400);
+  });
+});
+
+test('/print-batch: a non-array body is a 400, not a silent empty success', async () => {
+  const svc = stubService();
+  await withServer(createHttpApp(svc, {}), async (base) => {
+    const res = await post(base, '/print-batch', { not: 'an array' });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).status, 'error');
+    assert.equal(svc.calls.length, 0);
+  });
+});
+
 test('/health stays open for probes even with a key set', async () => {
   await withServer(createHttpApp(stubService(), { apiKey: 'k', shopName: 'X' }), async (base) => {
     const res = await fetch(base + '/health');

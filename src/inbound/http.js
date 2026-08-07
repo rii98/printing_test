@@ -56,12 +56,19 @@ export function createHttpApp(service, { shopName, apiKey, bodyLimit = '512kb' }
     res.status(code).json(result);
   }));
 
-  // Print many at once (e.g. an order that fans out to several stations).
+  // Print many at once (e.g. an order that fans out to several stations). The
+  // HTTP status reflects the AGGREGATE so a caller that only checks the code is
+  // never misled: 200 all accepted, 207 Multi-Status partial, 400 all failed.
+  // A non-array body is a client mistake (400) — not a silent empty success.
   app.post('/print-batch', auth, asyncRoute(async (req, res) => {
-    const list = Array.isArray(req.body) ? req.body : [];
+    if (!Array.isArray(req.body)) {
+      return res.status(400).json({ status: 'error', error: 'body must be a JSON array of tickets' });
+    }
     const results = [];
-    for (const t of list) results.push(await service.print(t));
-    res.json({ results });
+    for (const t of req.body) results.push(await service.print(t));
+    const errors = results.filter((r) => r.status === 'error').length;
+    const code = errors === 0 ? 200 : errors === results.length ? 400 : 207;
+    res.status(code).json({ results });
   }));
 
   app.get('/', (req, res) => res.json({ service: 'print-agent', endpoints: ['/health', 'POST /print', 'POST /print-batch'] }));
