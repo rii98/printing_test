@@ -55,6 +55,7 @@ export class ValidationError extends Error {
 }
 
 const isFiniteNum = (v) => typeof v === 'number' && Number.isFinite(v);
+const isNonNegInt = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
 
 /**
  * Validate + normalize an untrusted ticket into a clean, defaulted Ticket.
@@ -93,10 +94,18 @@ export function normalizeTicket(raw) {
     if (raw[f] != null && (!isFiniteNum(raw[f]) || raw[f] < 0)) throw new ValidationError(`ticket.${f} must be a number >= 0`);
   }
 
+  // revision and number are DISCRETE identifiers, not measurements. Reject a
+  // non-integer or negative value rather than silently coercing it to a default:
+  // the old `isFiniteNum(x) ? x : 0` turned a string "2" or a stray 1.5 into
+  // revision 0, collapsing distinct revisions of a ticket into one idempotency
+  // key — a real edit would then be dropped as a "duplicate" and never print.
+  if (raw.revision != null && !isNonNegInt(raw.revision)) throw new ValidationError('ticket.revision must be a non-negative integer');
+  if (raw.number != null && !isNonNegInt(raw.number)) throw new ValidationError('ticket.number must be a non-negative integer');
+
   return {
     id: raw.id.trim(),
-    revision: isFiniteNum(raw.revision) ? raw.revision : 0,
-    number: isFiniteNum(raw.number) ? raw.number : undefined,
+    revision: raw.revision != null ? raw.revision : 0,
+    number: raw.number != null ? raw.number : undefined,
     station: raw.station,
     orderType: ['dine-in', 'takeaway', 'delivery'].includes(raw.orderType) ? raw.orderType : undefined,
     table: typeof raw.table === 'string' ? raw.table : undefined,
