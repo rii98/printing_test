@@ -1,0 +1,122 @@
+/**
+ * Neutral domain model. This is OURS — deliberately independent of snackk's
+ * `OrderTicketDto`. When we integrate, one small adapter maps their DTO to this;
+ * the whole core depends only on the shapes below, so nothing here is coupled to
+ * any upstream system.
+ *
+ * @typedef {'kitchen'|'bar'|'cashier'} Station
+ * @typedef {'kot'|'bot'|'bill'} DocKind
+ *
+ * @typedef {Object} TicketItem
+ * @property {string} name
+ * @property {number} [qty=1]
+ * @property {number} [price]           Unit price (minor→major currency, e.g. 3.50). Omitted on KOT/BOT.
+ * @property {string[]} [modifiers]     e.g. ["No onion", "Extra spicy"]
+ * @property {string} [note]            Free text for the line.
+ * @property {boolean} [voided]         A single line pulled before prep.
+ *
+ * @typedef {Object} Ticket
+ * @property {string} id                Stable unique id — the idempotency key.
+ * @property {number} [revision=0]      Bumps when the ticket changes; (id,revision) prints once.
+ * @property {number} [number]          Human-facing ticket number.
+ * @property {Station} station          Which station this ticket is for.
+ * @property {'dine-in'|'takeaway'|'delivery'} [orderType]
+ * @property {string} [table]
+ * @property {string} [server]          Waiter/staff name.
+ * @property {string|Date} [placedAt]
+ * @property {TicketItem[]} items
+ * @property {boolean} [voided]         Whole-ticket cancellation → prints a VOID slip.
+ * @property {string} [voidReason]
+ * // bill-only fields:
+ * @property {number} [discount]        Positive number subtracted from subtotal.
+ * @property {number} [taxRate]         e.g. 0.13 for 13% VAT.
+ * @property {string} [taxLabel]        e.g. "VAT 13%".
+ * @property {number} [serviceCharge]   Positive number added.
+ * @property {number} [total]           If given, trusted verbatim; else computed.
+ * @property {string} [currency]        e.g. "Rs", "$". Default from config.
+ * @property {string} [payment]         e.g. "Cash", "Card", "eSewa".
+ * @property {string} [footer]
+ * @property {string} [qr]              QR payload (URL, invoice ref…).
+ * @property {boolean} [openDrawer]     Kick the cash drawer after a bill.
+ */
+
+export const STATIONS = /** @type {const} */ (['kitchen', 'bar', 'cashier']);
+
+/** Which layout a station prints by default. Overridable in config. */
+export const STATION_DOC = /** @type {Record<Station,DocKind>} */ ({
+  kitchen: 'kot',
+  bar: 'bot',
+  cashier: 'bill',
+});
+
+export class ValidationError extends Error {
+  /** @param {string} msg */
+  constructor(msg) { super(msg); this.name = 'ValidationError'; }
+}
+
+const isFiniteNum = (v) => typeof v === 'number' && Number.isFinite(v);
+
+/**
+ * Validate + normalize an untrusted ticket into a clean, defaulted Ticket.
+ * Throws ValidationError with a precise message — never prints garbage.
+ * @param {any} raw
+ * @returns {Ticket}
+ */
+export function normalizeTicket(raw) {
+  if (!raw || typeof raw !== 'object') throw new ValidationError('ticket must be an object');
+  if (typeof raw.id !== 'string' || raw.id.trim() === '') throw new ValidationError('ticket.id (non-empty string) is required');
+  if (!STATIONS.includes(raw.station)) throw new ValidationError(`ticket.station must be one of ${STATIONS.join(', ')}`);
+
+  const voided = raw.voided === true;
+  const items = Array.isArray(raw.items) ? raw.items : [];
+  // A void slip needs no items; a normal ticket must have at least one.
+  if (!voided && items.length === 0) throw new ValidationError('ticket.items must be a non-empty array');
+
+  /** @type {TicketItem[]} */
+  const normItems = items.map((it, i) => {
+    if (!it || typeof it !== 'object') throw new ValidationError(`items[${i}] must be an object`);
+    if (typeof it.name !== 'string' || it.name.trim() === '') throw new ValidationError(`items[${i}].name is required`);
+    const qty = it.qty == null ? 1 : it.qty;
+    if (!isFiniteNum(qty) || qty <= 0) throw new ValidationError(`items[${i}].qty must be a positive number`);
+    if (it.price != null && (!isFiniteNum(it.price) || it.price < 0)) throw new ValidationError(`items[${i}].price must be >= 0`);
+    return {
+      name: it.name.trim(),
+      qty,
+      price: it.price != null ? Number(it.price) : undefined,
+      modifiers: Array.isArray(it.modifiers) ? it.modifiers.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim()) : undefined,
+      note: typeof it.note === 'string' && it.note.trim() ? it.note.trim() : undefined,
+      voided: it.voided === true,
+    };
+  });
+
+  for (const f of ['discount', 'taxRate', 'serviceCharge', 'total']) {
+    if (raw[f] != null && (!isFiniteNum(raw[f]) || raw[f] < 0)) throw new ValidationError(`ticket.${f} must be a number >= 0`);
+  }
+
+  return {
+    id: raw.id.trim(),
+    revision: isFiniteNum(raw.revision) ? raw.revision : 0,
+    number: isFiniteNum(raw.number) ? raw.number : undefined,
+    station: raw.station,
+    orderType: ['dine-in', 'takeaway', 'delivery'].includes(raw.orderType) ? raw.orderType : undefined,
+    table: typeof raw.table === 'string' ? raw.table : undefined,
+    server: typeof raw.server === 'string' ? raw.server : undefined,
+    placedAt: raw.placedAt ?? undefined,
+    items: normItems,
+    voided,
+    voidReason: typeof raw.voidReason === 'string' ? raw.voidReason : undefined,
+    discount: raw.discount != null ? Number(raw.discount) : undefined,
+    taxRate: raw.taxRate != null ? Number(raw.taxRate) : undefined,
+    taxLabel: typeof raw.taxLabel === 'string' ? raw.taxLabel : undefined,
+    serviceCharge: raw.serviceCharge != null ? Number(raw.serviceCharge) : undefined,
+    total: raw.total != null ? Number(raw.total) : undefined,
+    currency: typeof raw.currency === 'string' ? raw.currency : undefined,
+    payment: typeof raw.payment === 'string' ? raw.payment : undefined,
+    footer: typeof raw.footer === 'string' ? raw.footer : undefined,
+    qr: typeof raw.qr === 'string' ? raw.qr : undefined,
+    openDrawer: raw.openDrawer === true,
+  };
+}
+
+/** The idempotency key for a ticket render. */
+export const ticketKey = (/** @type {Ticket} */ t) => `${t.id}@${t.revision ?? 0}${t.voided ? ':void' : ''}`;
