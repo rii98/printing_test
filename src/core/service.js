@@ -62,11 +62,17 @@ export class PrintService {
       return { status: 'duplicate', ticket: key };
     }
 
-    const docKind = printer.docKind ?? STATION_DOC[ticket.station];
-    const doc = renderTicket(ticket, { docKind, branding: this.branding });
-    const bytes = encode(doc, { width: printer.width, encoding: printer.encoding ?? 'latin1', cut: printer.cut !== false, cutFeed: printer.cutFeed });
-
+    // Render, encode, and enqueue share one failure contract: none of them has
+    // durably accepted the ticket, so ANY throw here must free the reserved key —
+    // otherwise the key stays claimed forever and every retry is silently dropped
+    // as a "duplicate", LOSING the receipt (the worst possible direction). Keeping
+    // render+encode inside this try is what closes that gap: a layout/encoder fault
+    // (bad code page, a future template bug) rolls back instead of leaking the key
+    // and rejecting the promise into the caller.
     try {
+      const docKind = printer.docKind ?? STATION_DOC[ticket.station];
+      const doc = renderTicket(ticket, { docKind, branding: this.branding });
+      const bytes = encode(doc, { width: printer.width, encoding: printer.encoding ?? 'latin1', cut: printer.cut !== false, cutFeed: printer.cutFeed });
       await printer.queue.enqueue({ id: key, key, bytes, label: `${ticket.station}#${ticket.number ?? ''}` });
     } catch (err) {
       // The ticket was never durably accepted — free the key so a retry can print.

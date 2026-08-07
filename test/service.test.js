@@ -76,6 +76,31 @@ test('a failed enqueue rolls back the reservation so a retry can print', async (
   assert.equal(queue.transport.sent.length, 1);
 });
 
+test('a render/encode failure rolls back the key (never a phantom duplicate)', async () => {
+  // A printer whose encoding is invalid makes encode() throw AFTER the key is
+  // reserved but BEFORE enqueue. The reservation must be released so the caller
+  // gets an honest error and a corrected retry can still print — the ticket must
+  // never be stranded as an un-printable "duplicate".
+  const transport = fakeTransport();
+  const queue = new PrinterQueue({ printerId: 'cashier', transport, store: memoryStore(), sleep: () => Promise.resolve() });
+  const service = new PrintService({
+    printers: new Map([['cashier', { queue, width: 48, encoding: 'not-a-real-encoding', docKind: 'bill' }]]),
+    stationToPrinter: { cashier: 'cashier' },
+    idempotency: memoryIdempotency(),
+  });
+  const ticket = { id: 'enc1', station: 'cashier', items: [{ name: 'Coffee', qty: 1, price: 3.5 }] };
+
+  const first = await service.print({ ...ticket });
+  assert.equal(first.status, 'error', 'encode failure surfaces as an error, not a rejected promise');
+  assert.match(first.error, /encoding/i);
+  assert.equal(transport.sent.length, 0, 'nothing reached the printer');
+
+  // Same key again: because the reservation was rolled back, this is NOT a duplicate.
+  const second = await service.print({ ...ticket });
+  assert.equal(second.status, 'error', 'still the same encode fault, but still retryable');
+  assert.notEqual(second.status, 'duplicate', 'the key was freed — never stranded');
+});
+
 test('a new revision prints again', async () => {
   const { service, printers, transports } = buildService();
   await service.print({ id: 'o3', revision: 0, station: 'kitchen', items: [{ name: 'A', qty: 1 }] });
