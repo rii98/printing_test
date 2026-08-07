@@ -12,7 +12,7 @@ import { fileStore } from './adapters/store/file.js';
 import { memoryStore } from './adapters/store/memory.js';
 import { fileIdempotency } from './adapters/store/idempotency-file.js';
 import { memoryIdempotency } from './core/idempotency.js';
-import { discoverPrinters, normalizeMac } from './adapters/discovery/scan.js';
+import { discoverPrinters, normalizeMac, resolveHostMac } from './adapters/discovery/scan.js';
 import { logEvent, log } from './logger.js';
 
 /**
@@ -24,15 +24,30 @@ export async function buildService(cfg, { onEvent = logEvent } = {}) {
   // Idempotency matches the store's durability: durable on disk, or in-memory.
   const idempotency = cfg.store?.dir ? await fileIdempotency(cfg.store.dir) : memoryIdempotency();
 
-  // Resolve addresses: if any printer is MAC-configured and discovery is on, scan.
+  // Resolve MAC-configured printers to an IP. Do it in the cheapest way that still
+  // survives a DHCP move: first confirm each printer is still at its CONFIGURED
+  // host (a single probe, no scan); only if some MAC is still unplaced do we sweep
+  // the subnet. In the common case the printer hasn't moved, so no port scan ever
+  // touches the LAN.
   let macToIp = new Map();
-  const needsDiscovery = cfg.discovery.enabled && Object.values(cfg.printers).some((p) => p.mac);
-  if (needsDiscovery) {
-    log.info('scanning LAN for printers…', { subnet: cfg.discovery.subnet ?? 'auto' });
+  const macPrinters = Object.entries(cfg.printers).filter(([, p]) => p.mac);
+  if (cfg.discovery.enabled && macPrinters.length) {
+    const want = new Set(macPrinters.map(([, p]) => normalizeMac(p.mac)).filter(Boolean));
     try {
-      const found = await discoverPrinters({ subnet: cfg.discovery.subnet });
-      for (const { ip, mac } of found) if (mac) macToIp.set(mac, ip);
-      log.info(`discovery found ${found.length} printer port(s)`, { withMac: macToIp.size });
+      // 1) Targeted: is each printer still answering at its configured host?
+      for (const [, p] of macPrinters) {
+        const mac = await resolveHostMac(p.host, p.port ?? 9100);
+        if (mac && want.has(mac) && !macToIp.has(mac)) macToIp.set(mac, p.host);
+      }
+      // 2) Fallback: sweep the LAN only for MACs we still couldn't place.
+      const missing = [...want].filter((m) => !macToIp.has(m));
+      if (missing.length) {
+        log.info('scanning LAN for printers…', { subnet: cfg.discovery.subnet ?? 'auto', missing: missing.length });
+        const hosts = macPrinters.map(([, p]) => p.host).filter(Boolean);
+        const found = await discoverPrinters({ subnet: cfg.discovery.subnet, hosts });
+        for (const { ip, mac } of found) if (mac && want.has(mac) && !macToIp.has(mac)) macToIp.set(mac, ip);
+        log.info(`discovery found ${found.length} printer port(s)`, { placed: macToIp.size });
+      }
     } catch (e) { log.warn('discovery failed, using configured hosts', { error: String(e.message || e) }); }
   }
 
