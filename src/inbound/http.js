@@ -38,16 +38,24 @@ export function requireApiKey(apiKey) {
 
 /**
  * @param {import('../core/service.js').PrintService} service
- * @param {{shopName?:string, apiKey?:string|null, bodyLimit?:string}} [meta]
+ * @param {{shopName?:string, apiKey?:string|null, bodyLimit?:string,
+ *   snackkStatus?:()=>any}} [meta]
  *   bodyLimit — max accepted request body (default 512kb); injectable for tests.
+ *   snackkStatus — optional snapshot of the snackk SSE link for /health.
  */
-export function createHttpApp(service, { shopName, apiKey, bodyLimit = '512kb' } = {}) {
+export function createHttpApp(service, { shopName, apiKey, bodyLimit = '512kb', snackkStatus } = {}) {
   const app = express();
   app.use(express.json({ limit: bodyLimit }));
   const auth = requireApiKey(apiKey);
 
-  // Liveness + per-printer health/queue depth. Left open for probes/monitors.
-  app.get('/health', (req, res) => res.json({ ok: true, shop: shopName, ...service.health() }));
+  // Liveness + per-printer health/queue depth, plus the snackk SSE link status
+  // (connected? last event id? last byte/heartbeat? seed/reconnect counts?) so a
+  // probe or an operator can see the agent is actually subscribed — not silently
+  // wedged — without reading logs. `snackk` is absent when the integration is off.
+  app.get('/health', (req, res) => {
+    const snackk = snackkStatus?.() ?? { enabled: false };
+    res.json({ ok: true, shop: shopName, ...service.health(), snackk });
+  });
 
   // Print one ticket. Body = neutral Ticket (see src/core/domain.js).
   app.post('/print', auth, asyncRoute(async (req, res) => {

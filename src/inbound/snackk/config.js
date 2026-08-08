@@ -14,8 +14,14 @@ export function createConfigClient({ baseUrl, deviceKey, refreshMs = 30_000, fet
   let timer = null;
 
   async function fetchOnce() {
+    // A CONNECT/READ timeout is non-negotiable: on boot start() awaits this, so a
+    // snackk endpoint that accepts the socket but never responds (a half-open
+    // proxy) would otherwise hang the whole appliance and the local HTTP inbound
+    // would never bind. AbortSignal.timeout turns that hang into a caught failure
+    // that start() swallows (keeping local printing) and the poller retries.
     const res = await fetchImpl(`${baseUrl}/api/print/config`, {
       headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
       const e = new Error(`config → HTTP ${res.status}`);

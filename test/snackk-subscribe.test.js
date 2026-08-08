@@ -16,6 +16,26 @@ function sseResponse(frames) {
   return { ok: true, body };
 }
 
+/**
+ * A Response whose body streams `frames` then HANGS (never closes), like a live
+ * SSE link that has gone silent. It honors the fetch AbortSignal — aborting
+ * (idle watchdog, connect timeout, or stop()) errors the stream so the pending
+ * read rejects, exactly as a real socket abort does. This is what lets the tests
+ * exercise the watchdog: a plain closing stream can't, because it never hangs.
+ */
+function hangingSse(frames, { signal } = {}) {
+  const enc = new TextEncoder();
+  const body = new ReadableStream({
+    start(controller) {
+      for (const f of frames) controller.enqueue(enc.encode(f));
+      signal?.addEventListener('abort', () => {
+        try { controller.error(new Error('aborted')); } catch { /* already errored */ }
+      });
+    },
+  });
+  return { ok: true, body };
+}
+
 const kotDto = (over = {}) => JSON.stringify({
   orderId: 'o1', sessionId: 's1', tableLabel: 'T1', station: 'kitchen', state: 'received',
   ticketNumber: 1, voidReason: null, priority: 0, placedAt: '2026-08-08T10:00:00Z',
@@ -153,6 +173,113 @@ test('subscribeBills does not print when the live config is screens-only', async
   await new Promise((r) => setTimeout(r, 50));
   sub.stop();
   assert.equal(printed.length, 0);
+});
+
+test('idle watchdog reconnects when a connected stream goes silent (no heartbeat)', async () => {
+  // The classic NAT-death case: the socket delivered one heartbeat then went
+  // silent forever with no FIN. Without the watchdog, reader.read() blocks
+  // forever and the agent never reconnects. With it, the stream is aborted after
+  // idleTimeoutMs and the outer loop opens a fresh connection.
+  let streamConnects = 0;
+  const fetchImpl = (url, opts) => {
+    if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    streamConnects += 1;
+    return Promise.resolve(hangingSse([': ping\n\n'], opts)); // one ping, then silence
+  };
+  const sub = subscribeStation({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', station: 'kitchen',
+    service: { print: async () => ({ status: 'queued' }) },
+    getConfig: () => ({ stationDelivery: 'print', orderRoutingMode: 'direct' }),
+    printed: new Set(), log: NOLOG, fetchImpl, maxBackoffMs: 5,
+    idleTimeoutMs: 25, connectTimeoutMs: 1000, reconcileMs: 1_000_000,
+  });
+  await new Promise((r) => setTimeout(r, 200));
+  sub.stop();
+  assert.ok(streamConnects >= 2, `expected reconnect(s) after idle timeout, got ${streamConnects}`);
+});
+
+test('connect timeout reconnects when the initial fetch never returns headers', async () => {
+  // A half-open proxy accepts the socket but never sends a response. The connect
+  // timeout must abort so the loop retries instead of wedging on the open fetch.
+  let attempts = 0;
+  const fetchImpl = (url, opts) => {
+    if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    attempts += 1;
+    // Never resolves on its own — only the connect-timeout abort rejects it.
+    return new Promise((_, reject) => opts.signal?.addEventListener('abort', () => reject(new Error('connect timeout'))));
+  };
+  const sub = subscribeStation({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', station: 'kitchen',
+    service: { print: async () => ({ status: 'queued' }) },
+    getConfig: () => ({ stationDelivery: 'print', orderRoutingMode: 'direct' }),
+    printed: new Set(), log: NOLOG, fetchImpl, maxBackoffMs: 5,
+    idleTimeoutMs: 1000, connectTimeoutMs: 20, reconcileMs: 1_000_000,
+  });
+  await new Promise((r) => setTimeout(r, 150));
+  sub.stop();
+  assert.ok(attempts >= 2, `expected retries after connect timeout, got ${attempts}`);
+});
+
+test('periodic reconcile prints a KOT that appears while the stream stays connected', async () => {
+  // The stream is up the whole time (no reconnect), but a KOT was missed — a
+  // swallowed publish / dropped frame. It shows up on the board a moment later;
+  // the reconcile re-seed must print it without waiting for a reconnect.
+  const ticket = {
+    orderId: 'o5', sessionId: 's1', tableLabel: 'T1', station: 'kitchen', state: 'preparing',
+    ticketNumber: 5, voidReason: null, priority: 0, placedAt: '2026-08-08T10:00:00Z',
+    lines: [{ itemName: 'Dal', variantName: null, quantity: 1, modifiers: [], note: null }],
+  };
+  let boardHasTicket = false;
+  let streamConnects = 0;
+  const fetchImpl = (url, opts) => {
+    if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: boardHasTicket ? [ticket] : [] }) });
+    streamConnects += 1;
+    return Promise.resolve(hangingSse([': ping\n\n'], opts)); // connected, then quiet (no reconnect within the window)
+  };
+  const seen = new Set(); // stand in for the durable idempotency store
+  const printed = [];
+  const service = {
+    print: async (t) => { if (seen.has(t.id)) return { status: 'duplicate' }; seen.add(t.id); printed.push(t); return { status: 'queued' }; },
+  };
+  const sub = subscribeStation({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', station: 'kitchen', service,
+    getConfig: () => ({ stationDelivery: 'print', orderRoutingMode: 'direct' }),
+    printed: new Set(), log: NOLOG, fetchImpl, maxBackoffMs: 5,
+    idleTimeoutMs: 5000, connectTimeoutMs: 1000, reconcileMs: 25,
+  });
+  await new Promise((r) => setTimeout(r, 60)); // connect-seed ran against an empty board
+  assert.equal(printed.length, 0);
+  boardHasTicket = true;
+  await new Promise((r) => setTimeout(r, 120)); // a reconcile tick seeds the now-present ticket
+  sub.stop();
+  assert.equal(streamConnects, 1, 'stream must not have reconnected — reconcile alone delivered it');
+  assert.equal(printed.length, 1);
+  assert.equal(printed[0].id, 'o5');
+});
+
+test('status() reports the live link — connected + last event id + seed count', async () => {
+  const fetchImpl = (url, opts) => {
+    if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    return Promise.resolve(hangingSse([`id: 42\nevent: ticket.new\ndata: ${kotDto()}\n\n`], opts));
+  };
+  let resolveGot;
+  const got = new Promise((r) => { resolveGot = r; });
+  const service = { print: async () => { resolveGot(); return { status: 'queued' }; } };
+  const sub = subscribeStation({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', station: 'kitchen', service,
+    getConfig: () => ({ stationDelivery: 'print', orderRoutingMode: 'direct' }),
+    printed: new Set(), log: NOLOG, fetchImpl, maxBackoffMs: 5,
+    idleTimeoutMs: 5000, connectTimeoutMs: 1000, reconcileMs: 1_000_000,
+  });
+  await got;
+  await new Promise((r) => setTimeout(r, 10));
+  const s = sub.status();
+  sub.stop();
+  assert.equal(s.station, 'kitchen');
+  assert.equal(s.connected, true);
+  assert.equal(s.lastEventId, '42');
+  assert.ok(s.seeds >= 1, 'seeded on connect');
+  assert.ok(s.idleForMs != null && s.idleForMs >= 0);
 });
 
 test('boundedSet evicts the oldest beyond its limit', () => {
