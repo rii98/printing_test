@@ -154,6 +154,33 @@ export function printActionSeed(dto, config, printed) {
 }
 
 /**
+ * Decide what to do with one order from a VOID-recovery snapshot (fetched on
+ * (re)connect + reconcile, see subscribe.js `seedVoids`). The live stream only
+ * carries the void as a single `ticket.updated` transition; if the agent was
+ * offline when it fired, that event is gone (a void is terminal, so it never sits
+ * on a board for the active-seed to replay). This snapshot re-exposes recently
+ * voided orders so the slip still prints on recovery.
+ *
+ * Same guard as the live void path: print a VOID slip only if this agent printed
+ * the original KOT/BOT — otherwise no slip ever came out and a void is noise. The
+ * caller backs `printed.has` with the DURABLE idempotency store, so the guard
+ * holds even across the restart that motivates this path. The `id@0:void`
+ * idempotency key makes a re-seed of an already-printed void a no-op.
+ *
+ * @param {{orderId:string, state:string}} dto  a voided OrderTicketDto (state:'void')
+ * @param {{stationDelivery:'kds'|'print'|'both'}} config
+ * @param {{has:(k:string)=>boolean}} printed  orderIds known printed (durable-backed)
+ * @returns {{action:'print'|'skip', reason:string, ticket?:import('../../core/domain.js').Ticket}}
+ */
+export function printActionVoidSeed(dto, config, printed) {
+  const printing = config.stationDelivery === 'print' || config.stationDelivery === 'both';
+  if (!printing) return { action: 'skip', reason: 'kds-only' };
+  if (!isVoid(dto)) return { action: 'skip', reason: 'not-void' };
+  if (!printed.has(dto.orderId)) return { action: 'skip', reason: 'void-never-printed' };
+  return { action: 'print', reason: 'void-seed', ticket: orderTicketToTicket(dto) };
+}
+
+/**
  * Read a snackk NPR display string (server/domain/pricing.ts formatNPR, e.g.
  * `रू 1,234.56` or `-रू 50.00`) as a Number in major units. We parse rather than
  * print the string because the symbol is Devanagari and grouping is South-Asian —

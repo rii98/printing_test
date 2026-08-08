@@ -24,6 +24,9 @@
  * @property {(key:string)=>void|Promise<void>} commit    Confirm a reserved key is durably accepted.
  * @property {(key:string)=>void|Promise<void>} rollback  Release a reservation that never got accepted.
  * @property {(keys:string[])=>void|Promise<void>} seed   Mark keys already known to be accepted (boot hydration).
+ * @property {(key:string)=>boolean} has   Has this key been durably ACCEPTED (committed), not merely reserved?
+ *                                          Read-only; used to recover a VOID slip across a restart — a void
+ *                                          prints only if its KOT's key is already accepted here.
  */
 
 /**
@@ -58,5 +61,9 @@ export function memoryIdempotency(limit = 5000) {
     commit() {},
     rollback(key) { forget(key); },
     seed(keys) { for (const k of keys) remember(k); },
+    // In memory the reservation IS the record, so a reserved key already reads as
+    // "seen". That is the safe direction for void recovery: at worst a VOID slip
+    // prints for a KOT still mid-flight, never suppressed for one that did print.
+    has(key) { return seen.has(key); },
   };
 }

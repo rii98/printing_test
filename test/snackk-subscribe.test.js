@@ -106,6 +106,7 @@ test('seeds the active board on connect, printing a KOT missed while disconnecte
   let streamCalls = 0;
   const fetchImpl = async (url) => {
     if (url.endsWith('/active')) return { ok: true, json: async () => ({ mode: 'direct', tickets: [seedTicket] }) };
+    if (url.includes('/voids/recent')) return { ok: true, json: async () => ({ tickets: [] }) };
     // The station stream: open once (empty), then refuse reconnects.
     return ++streamCalls === 1 ? sseResponse(['retry: 3000\n\n']) : { ok: false, status: 499, body: null };
   };
@@ -183,6 +184,7 @@ test('idle watchdog reconnects when a connected stream goes silent (no heartbeat
   let streamConnects = 0;
   const fetchImpl = (url, opts) => {
     if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
     streamConnects += 1;
     return Promise.resolve(hangingSse([': ping\n\n'], opts)); // one ping, then silence
   };
@@ -233,6 +235,7 @@ test('periodic reconcile prints a KOT that appears while the stream stays connec
   let streamConnects = 0;
   const fetchImpl = (url, opts) => {
     if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: boardHasTicket ? [ticket] : [] }) });
+    if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
     streamConnects += 1;
     return Promise.resolve(hangingSse([': ping\n\n'], opts)); // connected, then quiet (no reconnect within the window)
   };
@@ -260,6 +263,7 @@ test('periodic reconcile prints a KOT that appears while the stream stays connec
 test('status() reports the live link — connected + last event id + seed count', async () => {
   const fetchImpl = (url, opts) => {
     if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
     return Promise.resolve(hangingSse([`id: 42\nevent: ticket.new\ndata: ${kotDto()}\n\n`], opts));
   };
   let resolveGot;
@@ -292,4 +296,105 @@ test('boundedSet evicts the oldest beyond its limit', () => {
   assert.equal(s.size(), 2);
   s.add('b'); // a re-add is a no-op, never grows or reorders
   assert.equal(s.size(), 2);
+});
+
+// ── recovery: VOID slips and settled bills survive a restart/offline window ──
+
+test('subscribeStation recovers a VOID slip from the snapshot when the KOT was printed', async () => {
+  // The void fired while the agent was offline: it never hit a board (terminal),
+  // so the active-seed can't replay it. The voids snapshot re-exposes it; the slip
+  // prints because the durable-backed `printed` says the KOT did print.
+  const voided = {
+    orderId: 'ov', sessionId: 's1', tableLabel: 'T2', station: 'kitchen', state: 'void',
+    ticketNumber: 4, voidReason: 'Sent back', priority: 0, placedAt: '2026-08-08T10:00:00Z', lines: [],
+  };
+  const fetchImpl = (url, opts) => {
+    if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [voided] }) });
+    return Promise.resolve(hangingSse([': ping\n\n'], opts));
+  };
+  const printed = [];
+  const service = { print: async (t) => { printed.push(t); return { status: 'queued' }; } };
+  const sub = subscribeStation({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', station: 'kitchen', service,
+    getConfig: () => ({ stationDelivery: 'print', orderRoutingMode: 'direct' }),
+    printed: { has: () => true, add: () => {} }, // durable store: the KOT was printed
+    log: NOLOG, fetchImpl, maxBackoffMs: 5, idleTimeoutMs: 5000, reconcileMs: 1_000_000,
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  sub.stop();
+  assert.equal(printed.length, 1);
+  assert.equal(printed[0].id, 'ov');
+  assert.equal(printed[0].voided, true);
+  assert.equal(printed[0].voidReason, 'Sent back');
+});
+
+test('subscribeStation does NOT recover a void whose KOT it never printed', async () => {
+  const voided = {
+    orderId: 'ov2', sessionId: 's1', tableLabel: 'T2', station: 'kitchen', state: 'void',
+    ticketNumber: 5, voidReason: null, priority: 0, placedAt: '2026-08-08T10:00:00Z', lines: [],
+  };
+  const fetchImpl = (url, opts) => {
+    if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [voided] }) });
+    return Promise.resolve(hangingSse([': ping\n\n'], opts));
+  };
+  const printed = [];
+  const service = { print: async (t) => { printed.push(t); return { status: 'queued' }; } };
+  const sub = subscribeStation({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', station: 'kitchen', service,
+    getConfig: () => ({ stationDelivery: 'print', orderRoutingMode: 'direct' }),
+    printed: { has: () => false, add: () => {} }, // never printed the KOT → no slip
+    log: NOLOG, fetchImpl, maxBackoffMs: 5, idleTimeoutMs: 5000, reconcileMs: 1_000_000,
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  sub.stop();
+  assert.equal(printed.length, 0);
+});
+
+test('subscribeBills recovers a settled bill from the snapshot on connect', async () => {
+  // A bill settled while the agent was offline: bill.print went to a channel with
+  // no subscriber and is gone. The recovery snapshot re-exposes it on reconnect.
+  const bill = {
+    sessionId: 'sb', tableLabel: 'T9', status: 'closed', billNumber: 7,
+    closedAt: '2026-08-08T10:00:00Z', vatRate: '13.00',
+    lines: [{ itemName: 'Momo', quantity: 1, lineTotal: 'रू 100.00' }],
+    subtotal: 'रू 100.00', discount: 'रू 0.00', serviceCharge: 'रू 10.00', vat: 'रू 13.00', total: 'रू 123.00',
+  };
+  const fetchImpl = (url, opts) => {
+    if (url.includes('/bills/recent')) return Promise.resolve({ ok: true, json: async () => ({ bills: [bill] }) });
+    return Promise.resolve(hangingSse([': ping\n\n'], opts)); // stream stays connected
+  };
+  const printed = [];
+  const service = { print: async (t) => { printed.push(t); return { status: 'queued' }; } };
+  const sub = subscribeBills({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', service,
+    getConfig: () => ({ stationDelivery: 'print' }),
+    log: NOLOG, fetchImpl, maxBackoffMs: 5, idleTimeoutMs: 5000, reconcileMs: 1_000_000,
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  sub.stop();
+  assert.equal(printed.length, 1);
+  assert.equal(printed[0].id, 'bill:sb');
+  assert.equal(printed[0].station, 'cashier');
+  assert.equal(printed[0].number, 7);
+});
+
+test('subscribeBills recovery honors a screens-only flip (no receipt)', async () => {
+  let billsFetched = false;
+  const fetchImpl = (url, opts) => {
+    if (url.includes('/bills/recent')) { billsFetched = true; return Promise.resolve({ ok: true, json: async () => ({ bills: [] }) }); }
+    return Promise.resolve(hangingSse([': ping\n\n'], opts));
+  };
+  const printed = [];
+  const service = { print: async (t) => { printed.push(t); return { status: 'queued' }; } };
+  const sub = subscribeBills({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', service,
+    getConfig: () => ({ stationDelivery: 'kds' }), // screens-only
+    log: NOLOG, fetchImpl, maxBackoffMs: 5, idleTimeoutMs: 5000, reconcileMs: 1_000_000,
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  sub.stop();
+  assert.equal(billsFetched, false, 'no recovery fetch at all when screens-only');
+  assert.equal(printed.length, 0);
 });

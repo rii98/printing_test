@@ -78,7 +78,10 @@ long-lived SSE link over NAT can die *silently* (wifi sleep, ISP reset, NAT idle
 timeout) with no TCP FIN. The agent guards every stream with an **idle
 watchdog**, reconnects with backoff, **re-seeds** the current board on every
 reconnect, and runs a **periodic reconcile** — so a missed KOT self-heals and a
-replayed one never double-prints. See [§11](#11-part-h--reliability-design-reference).
+replayed one never double-prints. **Settled bills and VOID slips** that happened
+while the agent was offline are recovered the same way, from their own snapshot
+endpoints ([§11.7](#117-recovery-of-settled-bills--void-slips-offlinerestart)).
+See [§11](#11-part-h--reliability-design-reference).
 
 ---
 
@@ -481,8 +484,8 @@ kitchen and a double bill is an angry guest.
 
 | Command | Where | Covers |
 |---------|-------|--------|
-| `node --test` | agent | **137 tests** — ESC/POS encoding, cut bytes, queue durability/retry/dead-letter, idempotency, the SSE parser, the snackk mapper & print-decision policy, **the idle watchdog, connect timeout, reconcile, and `/health` status**. |
-| `node --test test/snackk-subscribe.test.js` | agent | Just the SSE subscriber: watchdog reconnect, connect-timeout reconnect, reconcile-prints-a-missed-KOT, `status()` shape. |
+| `node --test` | agent | **148 tests** — ESC/POS encoding, cut bytes, queue durability/retry/dead-letter, idempotency (incl. durable `has()` across restart), the SSE parser, the snackk mapper & print-decision policy, **bill & VOID recovery seeds**, **the idle watchdog, connect timeout, reconcile, and `/health` status**. |
+| `node --test test/snackk-subscribe.test.js` | agent | Just the SSE subscriber: watchdog reconnect, connect-timeout reconnect, reconcile-prints-a-missed-KOT, **bill/VOID recovery on connect**, `status()` shape. |
 | `npx vitest run` | snackk | Full unit suite (DB-gated tests self-skip without a DB). |
 | `npm run lint` | snackk | `tsc --noEmit` typecheck. |
 | `npx vite build` | snackk | Frontend build. |
@@ -622,6 +625,31 @@ against a snackk instance and `/health` open in another terminal.
   `/health` shows `config.stationDelivery: kds` and new orders stop printing.
 - **Pass:** the change takes effect within ~30s; no crash, no stuck state.
 
+#### F3-8 — Bill recovery (settled while the agent was offline)
+
+- **Why:** a `bill.print` fired while the agent is down goes to a channel with no
+  subscriber and is gone. Recovery must re-fetch it (§11.7).
+- **Do:** **stop the agent** (Ctrl-C). In snackk, **settle** a tab (§8 Step 6).
+  **Restart the agent.**
+- **Expect (log):** on connect, `[snackk] subscribed bills` then
+  `[snackk] bill <sessionId> → queued` for the settled tab (from `seedBills`).
+  A second settle-while-up prints live; a restart after that logs `→ duplicate`.
+- **Pass:** exactly **one** customer bill prints for the settled tab, even though
+  the settle happened with no agent connected. `feeds[bills].seeds` ≥ 1.
+
+#### F3-9 — VOID recovery (voided while offline, and across a restart)
+
+- **Why:** a void is terminal — never on a board — so only the voids snapshot can
+  recover it, and the "did we print the KOT?" gate must survive a restart (§11.7).
+- **Do:** place an order so the **KOT prints**. **Stop the agent.** In snackk,
+  **void** that whole ticket. **Restart the agent.**
+- **Expect (log):** on connect, after the board seed, `[snackk] kitchen <orderId>
+  → queued (void-seed)` — the slip prints because the durable store still knows the
+  KOT was printed before the restart.
+- **Pass:** exactly **one** VOID slip prints. Control: void an order whose KOT the
+  agent **never** printed (fired+voided entirely while offline) → **no** VOID slip
+  (`void-never-printed`), which is correct — nothing was ever sent to pull.
+
 ---
 
 ## 10. Part G — Troubleshooting
@@ -682,16 +710,34 @@ snackk ever changes `formatNPR` to non-Latin digits, revisit this.
 `src/index.js`. `app.listen` binds **before** the snackk agent starts (agent runs
 in the background), so the local HTTP inbound is never blocked by a slow cloud.
 
-### 11.7 Known, accepted gaps
-- **Bills aren't seeded** (no "active bills" concept): a bill settled while the
-  agent is disconnected won't auto-print (recoverable at the counter with the
-  browser Print button). A settle-outbox would close it.
-- **VOID after restart:** the printed-set that gates VOID slips is in-memory; a
-  restart between a fire and its void drops that one VOID slip (a missing VOID ≪ a
-  missing KOT, which the seed covers).
-- **Idempotency window** is 10,000 keys — a ticket sitting on the board across
-  10k *distinct* subsequent prints could reprint on re-seed. Implausible at real
-  volumes.
+### 11.7 Recovery of settled bills & VOID slips (offline/restart)
+A KOT sits on a board, so `active` re-seeds it. A **settled bill** and a
+**whole-ticket void** are *terminal* — neither appears on a board — so they need
+their own recovery source. Two snapshot endpoints, replayed on every (re)connect
+**and** the ~90s reconcile, exactly like the board seed:
+
+- **Bills** — `subscribeBills.seedBills()` GETs `/api/print/bills/recent?since=`;
+  each recently settled bill maps through the same `billToTicket` as the live
+  `bill.print`, so the `bill:<sessionId>` key dedupes a bill that already printed.
+  (Screens-only tenants get an empty list — the server gates it like the live emit.)
+- **Voids** — `subscribeStation.seedVoids()` GETs
+  `/api/print/station/:station/voids/recent?since=`; each recently voided order
+  prints a VOID slip **only if its KOT was printed**, and the `id@0:void` key dedupes.
+
+The "was the KOT printed?" gate is now **durable**: `printed.has(orderId)` falls
+back to `service.hasPrinted('<orderId>@0')`, which reads the on-disk idempotency
+store — so a KOT committed *before* a restart still gates its void afterwards
+(the old in-memory-only set forgot on reboot). `since` is a bounded, server-clamped
+trailing window (12h default, 24h cap), so the scan can never be unbounded; the
+durable store makes every re-seed idempotent, so the window can be generous.
+
+### 11.8 Known, accepted gaps
+- **Whole lifecycle offline:** an order that both *fired and voided* while the
+  agent was down never printed a KOT, so no VOID slip is emitted on recovery
+  (there is nothing to pull — the correct outcome).
+- **Idempotency window** is 10,000 keys — a KOT sitting on the board (or awaiting
+  its void) across 10k *distinct* subsequent prints could reprint / stop gating on
+  re-seed. Implausible at real volumes.
 
 ---
 
@@ -705,7 +751,9 @@ See [§4.3](#43-environment-variables).
 | Method & path | Auth | Purpose |
 |---------------|------|---------|
 | `GET /api/print/config` | device key | Delivery mode, routing mode, receipt identity. Polled every 30s. |
-| `GET /api/print/station/:station/active` | device key | Board snapshot for seed/reconcile. |
+| `GET /api/print/station/:station/active` | device key | Board snapshot for seed/reconcile (KOT/BOT recovery). |
+| `GET /api/print/station/:station/voids/recent?since=` | device key | Recently voided orders — VOID-slip recovery on (re)connect + reconcile. |
+| `GET /api/print/bills/recent?since=` | device key | Recently settled bills — receipt recovery on (re)connect + reconcile. |
 | `GET /api/stream/print/station/:station` | device key | Live SSE KOT/BOT feed (`ticket.new`/`ticket.updated`). |
 | `GET /api/stream/print/bills` | device key | Live SSE bill feed (`bill.print`). |
 | `POST /api/settings/printing/enable` | owner cookie | Turn the feature on + set delivery (first enable seeds delivery). |
@@ -715,7 +763,7 @@ See [§4.3](#43-environment-variables).
 
 ```bash
 # agent
-npm install ; node --test                       # install + 137 tests
+npm install ; node --test                       # install + 148 tests
 npm start                                        # standalone HTTP print server
 npm run verify cuts|waiters|offline|crash-*      # offline printer drills
 

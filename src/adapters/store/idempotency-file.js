@@ -75,5 +75,13 @@ export async function fileIdempotency(dir, { limit = 10_000 } = {}) {
       for (const k of keys) if (!committed.has(k)) { commitKey(k); changed = true; }
       return changed ? persist() : Promise.resolve();
     },
+    // Was this key DURABLY accepted? Only committed keys count — a bare reservation
+    // is an in-flight, not-yet-printed ticket and must not make its void look
+    // recoverable. This is what survives a restart: a KOT committed before the
+    // reboot still reads true, so a void that lands after it prints its slip. The
+    // window is bounded (see `limit`), so a KOT evicted after >limit later prints
+    // stops recovering its void — the safe direction (a missed VOID beats a missed
+    // KOT), and `limit` is far larger than any plausible fire→void gap.
+    has(key) { return committed.has(key); },
   };
 }

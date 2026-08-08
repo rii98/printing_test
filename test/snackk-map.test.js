@@ -5,6 +5,7 @@ import {
   isPrintFire,
   isVoid,
   orderTicketToTicket,
+  printActionVoidSeed,
   parseNpr,
   billToTicket,
 } from '../src/inbound/snackk/map.js';
@@ -156,4 +157,31 @@ test('billToTicket prefers exact paisa over the display string for total/discoun
   const t = billToTicket(billDto({ total: 'रू 999.99', totalPaisa: 30750, discount: 'रू 999.99', discountPaisa: 1549 }));
   assert.equal(t.totals.total, 307.5);
   assert.equal(t.totals.discount, 15.49);
+});
+
+// ── printActionVoidSeed: recovering VOID slips from a snapshot ───────────────
+
+const printedWith = (...ids) => { const s = new Set(ids); return { has: (k) => s.has(k) }; };
+
+test('void-seed prints a VOID slip only when the KOT was printed', () => {
+  const voided = dto({ state: 'void', voidReason: 'Table left' });
+  const cfg = { stationDelivery: 'print', orderRoutingMode: 'direct' };
+
+  const yes = printActionVoidSeed(voided, cfg, printedWith(voided.orderId));
+  assert.equal(yes.action, 'print');
+  assert.equal(yes.reason, 'void-seed');
+  assert.equal(yes.ticket.voided, true);
+  assert.equal(yes.ticket.voidReason, 'Table left');
+  assert.equal(ticketKey(yes.ticket).endsWith(':void'), true, 'distinct :void idempotency key');
+
+  const no = printActionVoidSeed(voided, cfg, printedWith());
+  assert.equal(no.action, 'skip');
+  assert.equal(no.reason, 'void-never-printed');
+});
+
+test('void-seed skips a non-void ticket and respects kds-only', () => {
+  const cfg = { stationDelivery: 'print', orderRoutingMode: 'direct' };
+  assert.equal(printActionVoidSeed(dto({ state: 'preparing' }), cfg, printedWith('x')).reason, 'not-void');
+  const voided = dto({ state: 'void' });
+  assert.equal(printActionVoidSeed(voided, { stationDelivery: 'kds' }, printedWith(voided.orderId)).reason, 'kds-only');
 });

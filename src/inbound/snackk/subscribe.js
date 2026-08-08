@@ -27,7 +27,7 @@
 
 import { createSseParser } from './sse-parse.js';
 import { createConfigClient } from './config.js';
-import { printAction, printActionSeed, billToTicket } from './map.js';
+import { printAction, printActionSeed, printActionVoidSeed, billToTicket } from './map.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -39,6 +39,14 @@ const IDLE_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const RECONCILE_MS = 90_000;
+// How far back the recovery snapshots (settled bills, whole-ticket voids) look.
+// Unlike a station board — which stays populated so a missed KOT self-heals from
+// the live `active` snapshot — a settle and a void are TERMINAL: nothing keeps
+// them queryable, so the server re-exposes only a recent trailing window and the
+// agent replays it on every (re)connect + reconcile. Wide enough to cover a long
+// offline stretch (a closed box overnight); the durable idempotency store makes
+// re-seeding an already-printed bill/void a no-op, so the window can be generous.
+const RECOVER_LOOKBACK_MS = 12 * 60 * 60_000; // 12h
 
 /**
  * A Set of orderIds bounded to the most recent `limit`, oldest evicted (FIFO).
@@ -135,6 +143,7 @@ export function subscribeStation({
   baseUrl, deviceKey, station, service, getConfig, printed,
   log = console, fetchImpl = fetch, maxBackoffMs = 30_000,
   idleTimeoutMs = IDLE_TIMEOUT_MS, connectTimeoutMs = CONNECT_TIMEOUT_MS, reconcileMs = RECONCILE_MS,
+  recoverLookbackMs = RECOVER_LOOKBACK_MS,
 }) {
   let stopped = false;
   let lastEventId;
@@ -201,6 +210,40 @@ export function subscribeStation({
     status.seeds += 1;
   }
 
+  // Recover VOID slips. A whole-ticket void is terminal: it never lands on a board,
+  // so `seedActive` can't replay it, and if the agent was offline when it fired the
+  // live `ticket.updated` is gone for good. This snapshot re-exposes recently voided
+  // orders for the station; each prints a VOID slip ONLY if its KOT was printed
+  // (printActionVoidSeed, guard backed by the durable idempotency store so it holds
+  // across a restart). The `id@0:void` key dedupes, so re-seeding is a no-op — which
+  // is why it runs on every (re)connect AND the reconcile interval, exactly like the
+  // active seed. A missed void is far less costly than a missed KOT, so a fetch
+  // failure here is logged and dropped; the next reconcile covers it.
+  async function seedVoids() {
+    const cfg = getConfig();
+    if (!cfg) return;
+    let tickets;
+    try {
+      const since = Date.now() - recoverLookbackMs;
+      const res = await fetchImpl(`${baseUrl}/api/print/station/${station}/voids/recent?since=${since}`, {
+        headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`voids → HTTP ${res.status}`);
+      ({ tickets } = await res.json());
+    } catch (err) {
+      log.warn?.(`[snackk] ${station} void recovery failed: ${err.message}`);
+      return;
+    }
+    for (const dto of Array.isArray(tickets) ? tickets : []) {
+      try {
+        await applyDecision(dto, printActionVoidSeed(dto, cfg, printed));
+      } catch (err) {
+        log.warn?.(`[snackk] ${station} bad void ticket: ${err.message}`);
+      }
+    }
+  }
+
   async function connectOnce() {
     const headers = { Authorization: `Bearer ${deviceKey}`, Accept: 'text/event-stream' };
     if (lastEventId) headers['Last-Event-ID'] = lastEventId;
@@ -215,7 +258,11 @@ export function subscribeStation({
     log.info?.(`[snackk] subscribed ${station}`);
     // Seed before draining the live stream: any event that lands meanwhile is
     // read right after and deduped by the durable store, so the overlap is safe.
+    // KOTs first so their keys are committed, then voids (whose slip is gated on a
+    // printed KOT) — though across a restart that gate reads the durable store, not
+    // this run's seed, so the order is a clarity choice, not a correctness one.
     await seedActive();
+    await seedVoids();
     try {
       await pump({
         res, ac, idleTimeoutMs, isStopped: () => stopped,
@@ -258,6 +305,7 @@ export function subscribeStation({
   // a reconnect happens to fire. Idempotent (durable store dedupes) and cheap.
   reconcileTimer = setInterval(() => {
     seedActive().catch((err) => log.warn?.(`[snackk] ${station} reconcile: ${err?.message}`));
+    seedVoids().catch((err) => log.warn?.(`[snackk] ${station} void reconcile: ${err?.message}`));
   }, reconcileMs);
   reconcileTimer.unref?.(); // never keep the process alive just to reconcile
 
@@ -286,14 +334,16 @@ export function subscribeStation({
 export function subscribeBills({
   baseUrl, deviceKey, service, getConfig, log = console, fetchImpl = fetch, maxBackoffMs = 30_000,
   idleTimeoutMs = IDLE_TIMEOUT_MS, connectTimeoutMs = CONNECT_TIMEOUT_MS,
+  reconcileMs = RECONCILE_MS, recoverLookbackMs = RECOVER_LOOKBACK_MS,
 }) {
   let stopped = false;
   let lastEventId;
   let attempt = 0;
   let activeAc = null;
+  let reconcileTimer = null;
   const status = {
     station: 'bills', connected: false, lastEventId: undefined,
-    lastByteAt: 0, lastEventAt: 0, connects: 0, lastError: null,
+    lastByteAt: 0, lastEventAt: 0, connects: 0, seeds: 0, lastError: null,
   };
 
   async function handleBill(bill) {
@@ -303,6 +353,38 @@ export function subscribeBills({
     if (getConfig()?.stationDelivery === 'kds') return;
     const result = await service.print(billToTicket(bill));
     log.info?.(`[snackk] bill ${bill.sessionId} → ${result.status}`);
+  }
+
+  // Recover settled bills. Unlike the station board there is NO live snapshot the
+  // bill feed re-reads: a settle fires `bill.print` exactly once, and if the agent
+  // was offline it is gone. This snapshot re-exposes recently settled bills (one
+  // per bill number — the merged-group primary), each mapped by the same
+  // billToTicket the live path uses, so the `bill:<sessionId>` idempotency key
+  // dedupes a bill that already printed. Best-effort: a fetch failure is logged and
+  // the next reconnect/reconcile covers it. Runs on (re)connect + reconcile.
+  async function seedBills() {
+    if (getConfig()?.stationDelivery === 'kds') return; // screens-only: no receipts
+    let bills;
+    try {
+      const since = Date.now() - recoverLookbackMs;
+      const res = await fetchImpl(`${baseUrl}/api/print/bills/recent?since=${since}`, {
+        headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`bills → HTTP ${res.status}`);
+      ({ bills } = await res.json());
+    } catch (err) {
+      log.warn?.(`[snackk] bill recovery failed: ${err.message}`);
+      return;
+    }
+    for (const bill of Array.isArray(bills) ? bills : []) {
+      try {
+        await handleBill(bill);
+      } catch (err) {
+        log.warn?.(`[snackk] bad recovered bill: ${err.message}`);
+      }
+    }
+    status.seeds += 1;
   }
 
   async function connectOnce() {
@@ -317,6 +399,9 @@ export function subscribeBills({
     status.connects += 1;
     status.lastByteAt = Date.now();
     log.info?.('[snackk] subscribed bills');
+    // Recover any bill settled while we were disconnected before draining the live
+    // stream; an event landing meanwhile is read right after and deduped.
+    await seedBills();
     try {
       await pump({
         res, ac, idleTimeoutMs, isStopped: () => stopped,
@@ -354,9 +439,19 @@ export function subscribeBills({
     }
   })();
 
+  // Belt-and-suspenders reconcile: re-read the settled-bill snapshot on a slow
+  // cadence regardless of stream health, so a receipt missed while the stream
+  // stayed happily connected (a swallowed publish, a dropped frame) self-heals
+  // within ~a minute. Idempotent (durable store dedupes) and cheap.
+  reconcileTimer = setInterval(() => {
+    seedBills().catch((err) => log.warn?.(`[snackk] bill reconcile: ${err?.message}`));
+  }, reconcileMs);
+  reconcileTimer.unref?.();
+
   return {
     stop() {
       stopped = true;
+      if (reconcileTimer) clearInterval(reconcileTimer);
       activeAc?.abort(new Error('stopped'));
     },
     status: () => ({ ...status, idleForMs: status.lastByteAt ? Date.now() - status.lastByteAt : null }),
@@ -379,7 +474,18 @@ export async function startSnackkAgent({
   // down the local HTTP inbound. It logs and keeps polling; the agent starts
   // delivering the moment the config comes good.
   await config.start();
-  const printed = boundedSet();
+  // "Did we print this order's KOT?" — the gate on whether a later void prints a
+  // slip. The in-memory set is a fast path that a restart empties, so back the
+  // question with the DURABLE idempotency store: a KOT committed before a reboot
+  // still answers true, so its void — arriving live after the restart, or via the
+  // void-recovery seed — still prints. Keeps the pure {has,add} shape map.js
+  // expects, so nothing downstream learns where the answer comes from.
+  const printedSet = boundedSet();
+  const printed = {
+    has: (orderId) => printedSet.has(orderId) || service.hasPrinted(`${orderId}@0`),
+    add: (orderId) => printedSet.add(orderId),
+    size: () => printedSet.size(),
+  };
   const subs = stations.map((station) =>
     subscribeStation({ baseUrl, deviceKey, station, service, getConfig: () => config.get(), printed, log, fetchImpl }),
   );

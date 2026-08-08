@@ -102,3 +102,52 @@ test('file + service: a replay after restart is a duplicate and prints once (C3 
     assert.equal(second.sent, 0, 'not reprinted');
   });
 });
+
+// --- has(): the durable "did we accept this key?" read that void recovery uses ---
+
+test('memory: has() reflects reserved/committed and clears on rollback', () => {
+  const idem = memoryIdempotency();
+  assert.equal(idem.has('k@0'), false, 'unknown key');
+  idem.reserve('k@0');
+  assert.equal(idem.has('k@0'), true, 'in memory a reservation already reads as seen (safe direction)');
+  idem.rollback('k@0');
+  assert.equal(idem.has('k@0'), false, 'rolled-back key is forgotten');
+});
+
+test('file: has() is true only for COMMITTED keys, not bare reservations', async () => {
+  await withTmp(async (dir) => {
+    const idem = await fileIdempotency(dir);
+    assert.equal(idem.has('kot@0'), false);
+    idem.reserve('kot@0');
+    assert.equal(idem.has('kot@0'), false, 'a reserved-but-uncommitted KOT is NOT "printed"');
+    await idem.commit('kot@0');
+    assert.equal(idem.has('kot@0'), true, 'committed → printed');
+  });
+});
+
+test('file: has() survives a restart — a KOT committed before reboot still reads printed', async () => {
+  await withTmp(async (dir) => {
+    const a = await fileIdempotency(dir);
+    a.reserve('kot@0');
+    await a.commit('kot@0');
+    const b = await fileIdempotency(dir);                 // fresh process, same dir
+    assert.equal(b.has('kot@0'), true, 'so a void arriving after the restart still prints its slip');
+  });
+});
+
+test('service.hasPrinted delegates to the durable store', async () => {
+  await withTmp(async (dir) => {
+    const idem = await fileIdempotency(dir);
+    const svc = new PrintService({ printers: new Map(), stationToPrinter: {}, idempotency: idem });
+    assert.equal(svc.hasPrinted('o1@0'), false);
+    idem.reserve('o1@0');
+    await idem.commit('o1@0');
+    assert.equal(svc.hasPrinted('o1@0'), true);
+  });
+});
+
+test('service.hasPrinted is false when the store has no has() (older impl)', () => {
+  const idem = { reserve: () => true, commit() {}, rollback() {}, seed() {} };
+  const svc = new PrintService({ printers: new Map(), stationToPrinter: {}, idempotency: idem });
+  assert.equal(svc.hasPrinted('x@0'), false, 'degrades safely without throwing');
+});

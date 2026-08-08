@@ -86,6 +86,18 @@ export class PrintService {
     return { status: 'queued', ticket: key, printer: printerId };
   }
 
+  /**
+   * Has this ticket key been durably ACCEPTED already? The one read the snackk
+   * void-recovery path needs: a VOID slip should print only for a KOT this agent
+   * actually printed, and after a restart the in-memory "printed" set is empty —
+   * so that fact must come from the durable idempotency store, not RAM. Kept as a
+   * thin pass-through so the subscriber depends on the service, never on the store.
+   * @param {string} key  a ticket key (e.g. `${orderId}@0` for the KOT)
+   */
+  hasPrinted(key) {
+    return typeof this.idem.has === 'function' ? this.idem.has(key) : false;
+  }
+
   /** Health snapshot for the /health endpoint. */
   health() {
     const printers = {};
