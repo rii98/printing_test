@@ -190,8 +190,13 @@ adapter** that maps its events to `service.print(ticket)` — no core changes.
 For a cloud POS (e.g. snackk), the agent runs on-prem and **subscribes outbound**
 to the POS's per-station ticket stream (SSE) — the same stream a KDS uses — then
 prints each ticket. Because the agent dials out, **the agent's own IP never needs
-to be fixed**, and NAT is a non-issue. Replace `src/inbound/http.js` with an SSE
-subscriber; everything downstream is unchanged.
+to be fixed**, and NAT is a non-issue.
+
+> **The snackk integration is built** (see `src/inbound/snackk/`). For the full
+> operations + testing playbook — printer setup, running against local Docker or
+> Render, the `/health` dashboard, and the network-failure drills (idle watchdog,
+> reconnect, reconcile, printer outage) — see
+> **[`docs/SNACKK_INTEGRATION.md`](docs/SNACKK_INTEGRATION.md)**.
 
 ---
 
@@ -210,6 +215,11 @@ Node — only the printer addresses change between sites.
 
 ## Testing
 
-`npm test` runs 31 unit tests on the pure core (format, layouts, ESC/POS encoding,
-queue retry/dead-letter/recovery, routing, idempotency, validation) using Node's
-built-in runner and in-memory fakes — **no printer, no network, deterministic.**
+`npm test` runs the full unit suite (137 tests) on the pure core (format, layouts,
+ESC/POS encoding, queue retry/dead-letter/recovery, routing, idempotency,
+validation) **plus the snackk SSE adapter** (parser, mapper/print-policy, idle
+watchdog, connect timeout, reconcile, `/health` status) using Node's built-in
+runner and in-memory fakes — **no printer, no network, deterministic.**
+
+For the snackk integration's operations + full testing/drill playbook, see
+**[`docs/SNACKK_INTEGRATION.md`](docs/SNACKK_INTEGRATION.md)**.
