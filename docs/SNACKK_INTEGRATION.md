@@ -676,6 +676,11 @@ against a snackk instance and `/health` open in another terminal.
 
 The mechanisms that make the link trustworthy, and where they live.
 
+> **Known deferred findings:** see [`DEFERRED_AUDIT_FINDINGS.md`](./DEFERRED_AUDIT_FINDINGS.md)
+> for the accepted-but-not-yet-fixed items from the 2026-08-08 production audit
+> (merged-tab duplicate receipt, VAT-inclusive receipt reconciliation, `print`
+> ≡ `both`, recovery re-scan cost, and lower-severity notes).
+
 ### 11.1 Idle watchdog + connect timeout
 `src/inbound/snackk/subscribe.js` (`openStream`, `pump`). Every stream carries an
 `AbortController`. A **connect timeout** (15s) bounds the initial fetch; an **idle
