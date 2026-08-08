@@ -45,6 +45,11 @@ function defaults() {
     discovery: { enabled: true, subnet: null },
     shutdown: { graceMs: 10_000 },   // max time to drain in-flight prints before exiting
 
+    // snackk integration (outbound SSE). Off unless a URL + device key are set,
+    // so the HTTP inbound is the only path by default. The device key is minted
+    // in snackk's Settings (POST /api/settings/printer-device).
+    snackk: { url: null, deviceKey: null, stations: ['kitchen', 'bar'] },
+
     // printerId -> printer. station links a ticket to a printer.
     printers: {
       cashier: { station: 'cashier', host: '192.168.18.240', mac: '02:1f:e0:13:19:28', port: 9100, width: 48, encoding: 'latin1', cut: true, cutFeed: 7 },
@@ -71,6 +76,9 @@ function applyEnv(cfg) {
   if (process.env.PRINT_SUBNET) cfg.discovery.subnet = process.env.PRINT_SUBNET;
   cfg.shutdown.graceMs = envInt('PRINT_SHUTDOWN_GRACE_MS', cfg.shutdown.graceMs, (n) => n >= 0);
   if (process.env.PRINT_API_KEY) cfg.auth.token = process.env.PRINT_API_KEY;
+  if (process.env.SNACKK_URL) cfg.snackk.url = process.env.SNACKK_URL.replace(/\/+$/, '');
+  if (process.env.SNACKK_DEVICE_KEY) cfg.snackk.deviceKey = process.env.SNACKK_DEVICE_KEY;
+  if (process.env.SNACKK_STATIONS) cfg.snackk.stations = process.env.SNACKK_STATIONS.split(',').map((s) => s.trim()).filter(Boolean);
   return cfg;
 }
 
@@ -84,6 +92,7 @@ function merge(base, over) {
   out.policy = { ...base.policy, ...over.policy };
   out.discovery = { ...base.discovery, ...over.discovery };
   out.shutdown = { ...base.shutdown, ...over.shutdown };
+  out.snackk = { ...base.snackk, ...over.snackk };
   out.printers = { ...base.printers };
   for (const [id, p] of Object.entries(over.printers ?? {})) out.printers[id] = { ...base.printers[id], ...p };
   return out;

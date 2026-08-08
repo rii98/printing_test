@@ -18,16 +18,19 @@
  * @param {Array<{onIdle:()=>Promise<any>, depth?:number}>} o.queues
  * @param {number} [o.graceMs]
  * @param {{info:Function, warn:Function}} o.log
+ * @param {()=>void} [o.onStop]  called first — stop inbound producers (e.g. the
+ *   snackk SSE subscriber) so nothing enqueues or reconnects while we drain.
  * @param {(code:number)=>void} [o.exit]
  * @param {(cb:()=>void, ms:number)=>any} [o.setTimer]
  * @returns {(signal:string)=>Promise<void>}
  */
-export function createGracefulShutdown({ server, queues, graceMs = 10_000, log, exit = (c) => process.exit(c), setTimer = setTimeout }) {
+export function createGracefulShutdown({ server, queues, graceMs = 10_000, log, onStop, exit = (c) => process.exit(c), setTimer = setTimeout }) {
   let started = false;
   return async function shutdown(signal) {
     if (started) { log.warn(`${signal} again — forcing immediate exit`); return exit(1); }
     started = true;
     log.info(`${signal} received — draining queues (grace ${graceMs}ms)…`);
+    try { onStop?.(); } catch { /* stopping a subscriber must never block shutdown */ }
     try { server?.close?.(); } catch { /* already closing */ }
 
     // Either resolution ends the wait; a rejecting onIdle is treated as drained
