@@ -13,7 +13,7 @@
 
 import { createSseParser } from './sse-parse.js';
 import { createConfigClient } from './config.js';
-import { printAction, printActionSeed } from './map.js';
+import { printAction, printActionSeed, billToTicket } from './map.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -152,9 +152,76 @@ export function subscribeStation({
 }
 
 /**
- * Start the whole snackk inbound: load config, then subscribe every station.
- * Opt-in from boot — only called when a snackk URL + device key are configured,
- * so the HTTP inbound path is untouched when it isn't.
+ * Drive the restaurant's BILL feed (one channel, not per-station). Settled bills
+ * arrive as `bill.print`; each maps to a cashier receipt and prints via the same
+ * service.print() — money passed through verbatim (billToTicket). Mirrors
+ * subscribeStation's reconnect/backoff + Last-Event-ID resume; no seed and no
+ * void/printed-set logic — a settle fires once and a bill is never voided.
+ * @param {{baseUrl:string, deviceKey:string,
+ *   service:import('../../core/service.js').PrintService,
+ *   getConfig:()=>any, log?:any, fetchImpl?:typeof fetch, maxBackoffMs?:number}} o
+ */
+export function subscribeBills({
+  baseUrl, deviceKey, service, getConfig, log = console, fetchImpl = fetch, maxBackoffMs = 30_000,
+}) {
+  let stopped = false;
+  let lastEventId;
+  let attempt = 0;
+
+  async function handleBill(bill) {
+    // The server only emits when delivery includes paper, but re-check the live
+    // config so a bill queued just before the owner flipped back to screens-only
+    // never prints late.
+    if (getConfig()?.stationDelivery === 'kds') return;
+    const result = await service.print(billToTicket(bill));
+    log.info?.(`[snackk] bill ${bill.sessionId} → ${result.status}`);
+  }
+
+  async function connectOnce() {
+    const headers = { Authorization: `Bearer ${deviceKey}`, Accept: 'text/event-stream' };
+    if (lastEventId) headers['Last-Event-ID'] = lastEventId;
+    const res = await fetchImpl(`${baseUrl}/api/stream/print/bills`, { headers });
+    if (!res.ok || !res.body) throw new Error(`bills stream → HTTP ${res.status}`);
+    attempt = 0;
+    log.info?.('[snackk] subscribed bills');
+    const parser = createSseParser();
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    while (!stopped) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      for (const e of parser.push(dec.decode(value, { stream: true }))) {
+        if (e.id) lastEventId = e.id;
+        if (e.event === 'bill.print') {
+          try {
+            await handleBill(JSON.parse(e.data));
+          } catch (err) {
+            log.warn?.(`[snackk] bad bill frame: ${err.message}`);
+          }
+        }
+      }
+    }
+  }
+
+  (async () => {
+    while (!stopped) {
+      try {
+        await connectOnce();
+      } catch (err) {
+        if (!stopped) log.warn?.(`[snackk] bills disconnected: ${err.message}`);
+      }
+      if (stopped) break;
+      await sleep(Math.min(maxBackoffMs, 500 * 2 ** attempt++));
+    }
+  })();
+
+  return { stop() { stopped = true; } };
+}
+
+/**
+ * Start the whole snackk inbound: load config, then subscribe every station AND
+ * the bill feed. Opt-in from boot — only called when a snackk URL + device key
+ * are configured, so the HTTP inbound path is untouched when it isn't.
  * @param {{baseUrl:string, deviceKey:string,
  *   service:import('../../core/service.js').PrintService,
  *   stations?:string[], log?:any, fetchImpl?:typeof fetch}} o
@@ -171,7 +238,9 @@ export async function startSnackkAgent({
   const subs = stations.map((station) =>
     subscribeStation({ baseUrl, deviceKey, station, service, getConfig: () => config.get(), printed, log, fetchImpl }),
   );
-  log.info?.(`[snackk] agent started → ${baseUrl} (stations: ${stations.join(', ')})`);
+  // The cashier's settled-bill feed rides alongside the station feeds.
+  subs.push(subscribeBills({ baseUrl, deviceKey, service, getConfig: () => config.get(), log, fetchImpl }));
+  log.info?.(`[snackk] agent started → ${baseUrl} (stations: ${stations.join(', ')} + bills)`);
   return {
     stop() {
       config.stop();

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { subscribeStation, boundedSet } from '../src/inbound/snackk/subscribe.js';
+import { subscribeStation, subscribeBills, boundedSet } from '../src/inbound/snackk/subscribe.js';
 
 const NOLOG = { info() {}, warn() {} };
 
@@ -106,6 +106,53 @@ test('seeds the active board on connect, printing a KOT missed while disconnecte
   assert.equal(printed.length, 1);
   assert.equal(printed[0].id, 'o9');
   assert.equal(printed[0].items[0].name, 'Thukpa');
+});
+
+test('subscribeBills prints a settled bill on a bill.print event', async () => {
+  const bill = {
+    sessionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', tableLabel: 'T2', mergedTables: ['T2'],
+    status: 'closed', paid: true, billNumber: 7, restaurant: { name: 'X', panNumber: null },
+    openedAt: '2026-08-08T09:00:00Z', closedAt: '2026-08-08T10:00:00Z',
+    serviceChargeRate: '10.00', vatRate: '13.00', pricesIncludeVat: true,
+    lines: [{ itemName: 'Tea', quantity: 1, station: 'cashier', ticketNumber: 1, state: 'served', modifiers: [], unitPrice: 'रू 50.00', lineTotal: 'रू 50.00' }],
+    itemsSubtotal: 'रू 50.00', subtotal: 'रू 44.25', discount: 'रू 0.00', discountPaisa: 0,
+    discountKind: 'none', discountPct: null, discountLabel: null,
+    serviceCharge: 'रू 4.42', vat: 'रू 6.33', total: 'रू 55.00', totalPaisa: 5500,
+  };
+  const frames = ['retry: 3000\n\n', `id: 3\nevent: bill.print\ndata: ${JSON.stringify(bill)}\n\n`];
+  let calls = 0;
+  const fetchImpl = async () => (++calls === 1 ? sseResponse(frames) : { ok: false, status: 499, body: null });
+
+  const printed = [];
+  let resolveGot;
+  const got = new Promise((r) => { resolveGot = r; });
+  const service = { print: async (t) => { printed.push(t); resolveGot(); return { status: 'queued' }; } };
+
+  const sub = subscribeBills({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', service,
+    getConfig: () => ({ stationDelivery: 'both' }), log: NOLOG, fetchImpl, maxBackoffMs: 10,
+  });
+  await got;
+  sub.stop();
+  assert.equal(printed.length, 1);
+  assert.equal(printed[0].station, 'cashier');
+  assert.equal(printed[0].id, 'bill:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+  assert.equal(printed[0].totals.total, 55);
+});
+
+test('subscribeBills does not print when the live config is screens-only', async () => {
+  const frames = ['retry: 3000\n\n', `id: 1\nevent: bill.print\ndata: {"sessionId":"s","lines":[],"vatRate":"13.00","totalPaisa":100,"discountPaisa":0,"subtotal":"रू 1.00","serviceCharge":"रू 0.00","vat":"रू 0.00"}\n\n`];
+  let calls = 0;
+  const fetchImpl = async () => (++calls === 1 ? sseResponse(frames) : { ok: false, status: 499, body: null });
+  const printed = [];
+  const service = { print: async (t) => { printed.push(t); return { status: 'queued' }; } };
+  const sub = subscribeBills({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', service,
+    getConfig: () => ({ stationDelivery: 'kds' }), log: NOLOG, fetchImpl, maxBackoffMs: 10,
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  sub.stop();
+  assert.equal(printed.length, 0);
 });
 
 test('boundedSet evicts the oldest beyond its limit', () => {

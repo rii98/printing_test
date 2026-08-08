@@ -5,8 +5,11 @@ import {
   isPrintFire,
   isVoid,
   orderTicketToTicket,
+  parseNpr,
+  billToTicket,
 } from '../src/inbound/snackk/map.js';
 import { normalizeTicket, ticketKey } from '../src/core/domain.js';
+import { computeTotals } from '../src/core/render/layouts/bill.js';
 
 /** A minimal OrderTicketDto as snackk streams it. */
 const dto = (over = {}) => ({
@@ -102,4 +105,55 @@ test('the void slip keys DISTINCTLY from the KOT, so both print', () => {
   assert.equal(kot, '11111111-1111-1111-1111-111111111111@0');
   assert.equal(voided, '11111111-1111-1111-1111-111111111111@0:void');
   assert.notEqual(kot, voided);
+});
+
+// ── bills (Slice B) ─────────────────────────────────────────────────────────
+
+test('parseNpr reads snackk formatNPR strings (Devanagari symbol, grouping, sign)', () => {
+  assert.equal(parseNpr('रू 1,234.56'), 1234.56);
+  assert.equal(parseNpr('रू 0.00'), 0);
+  assert.equal(parseNpr('-रू 50.00'), -50);
+  assert.equal(parseNpr('रू 1,23,456.00'), 123456); // South-Asian grouping
+  assert.equal(parseNpr(undefined), 0);
+});
+
+/** A BillDto as snackk's settle emits it (money as formatNPR strings + exact paisa). */
+const billDto = (over = {}) => ({
+  sessionId: '99999999-9999-9999-9999-999999999999',
+  tableLabel: 'T7', mergedTables: ['T7'], status: 'closed', paid: true, billNumber: 42,
+  restaurant: { name: 'Momo House', panNumber: '123456789' },
+  openedAt: '2026-08-08T09:00:00Z', closedAt: '2026-08-08T10:00:00Z',
+  serviceChargeRate: '10.00', vatRate: '13.00', pricesIncludeVat: true,
+  lines: [{ itemName: 'Chicken Momo (Full)', quantity: 2, station: 'kitchen', ticketNumber: 3, state: 'served',
+            modifiers: [{ name: 'Extra spicy', priceDelta: '0.00' }], unitPrice: 'रू 132.74', lineTotal: 'रू 265.49' }],
+  itemsSubtotal: 'रू 300.00', subtotal: 'रू 265.49', discount: 'रू 15.49', discountPaisa: 1549,
+  discountKind: 'percent', discountPct: '5.00', discountLabel: null,
+  serviceCharge: 'रू 25.00', vat: 'रू 32.50', total: 'रू 307.50', totalPaisa: 30750,
+  ...over,
+});
+
+test('billToTicket → a valid cashier Ticket, money passed through verbatim', () => {
+  const t = normalizeTicket(billToTicket(billDto()));
+  assert.equal(t.station, 'cashier');
+  assert.equal(t.id, 'bill:99999999-9999-9999-9999-999999999999');
+  assert.equal(ticketKey(t), 'bill:99999999-9999-9999-9999-999999999999@0');
+  assert.equal(t.number, 42);
+  assert.equal(t.table, 'T7');
+  assert.equal(t.items[0].name, 'Chicken Momo (Full)');
+  assert.equal(t.items[0].amount, 265.49);
+  assert.deepEqual(t.items[0].modifiers, ['Extra spicy']);
+  assert.equal(t.taxLabel, 'VAT 13%');
+  // The trusted breakdown is exactly snackk's — discount/total from exact paisa.
+  const c = computeTotals(t);
+  assert.deepEqual(
+    { subtotal: c.subtotal, discount: c.discount, service: c.service, tax: c.tax, total: c.total },
+    { subtotal: 265.49, discount: 15.49, service: 25, tax: 32.5, total: 307.5 },
+  );
+});
+
+test('billToTicket prefers exact paisa over the display string for total/discount', () => {
+  // If a display string ever disagreed with the paisa, the exact integer wins.
+  const t = billToTicket(billDto({ total: 'रू 999.99', totalPaisa: 30750, discount: 'रू 999.99', discountPaisa: 1549 }));
+  assert.equal(t.totals.total, 307.5);
+  assert.equal(t.totals.discount, 15.49);
 });

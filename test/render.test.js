@@ -49,6 +49,34 @@ test('explicit total overrides computed', () => {
   assert.equal(computeTotals(bill).total, 999);
 });
 
+test('trusted breakdown renders upstream totals verbatim, never recomputed from items', () => {
+  // Item prices here would compute a WILDLY different bill (subtotal 100). The
+  // trusted `totals` (as snackk would send after VAT-inclusive + a promo) must
+  // win untouched — that is the guarantee the printed total matches the counter.
+  const bill = normalizeTicket({
+    id: 'bill:s1', station: 'cashier', currency: 'Rs',
+    items: [{ name: 'Momo', qty: 2, amount: 265.49 }],
+    totals: { subtotal: 265.49, discount: 15.49, service: 25, tax: 32.5, total: 307.5 },
+    taxLabel: 'VAT 13%',
+  });
+  const c = computeTotals(bill);
+  assert.deepEqual(
+    { subtotal: c.subtotal, discount: c.discount, service: c.service, tax: c.tax, total: c.total },
+    { subtotal: 265.49, discount: 15.49, service: 25, tax: 32.5, total: 307.5 },
+  );
+  const txt = toText(renderTicket(bill));
+  assert.match(txt, /TOTAL\s+RS 307\.50/i); // doubleH row; preview upper-cases it
+  assert.match(txt, /2x Momo\s+Rs 265\.49/); // the trusted per-line amount, not qty×price
+  assert.match(txt, /VAT 13%\s+Rs 32\.50/);
+});
+
+test('a partial/garbage trusted totals block is rejected whole (never half-prints)', () => {
+  assert.throws(
+    () => normalizeTicket({ id: 'b', station: 'cashier', items: [{ name: 'x', qty: 1, price: 1 }], totals: { subtotal: 10 } }),
+    /ticket\.totals\.discount must be a number/,
+  );
+});
+
 test('H4: printed line items sum exactly to the printed subtotal', () => {
   // On the old float code these three 0.125 lines each printed 0.13 while the
   // subtotal summed the raw floats and printed 0.25 — a receipt that didn't add up.

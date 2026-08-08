@@ -11,6 +11,9 @@
  * @property {string} name
  * @property {number} [qty=1]
  * @property {number} [price]           Unit price (minor→major currency, e.g. 3.50). Omitted on KOT/BOT.
+ * @property {number} [amount]          Trusted line total (major units). When set, the bill layout prints
+ *                                      it verbatim instead of computing qty×price — used when an upstream
+ *                                      (snackk) owns the line math incl. modifiers/rounding.
  * @property {string[]} [modifiers]     e.g. ["No onion", "Extra spicy"]
  * @property {string} [note]            Free text for the line.
  * @property {boolean} [voided]         A single line pulled before prep.
@@ -33,6 +36,10 @@
  * @property {string} [taxLabel]        e.g. "VAT 13%".
  * @property {number} [serviceCharge]   Positive number added.
  * @property {number} [total]           If given, trusted verbatim; else computed.
+ * @property {{subtotal:number, discount:number, service:number, tax:number, total:number}} [totals]
+ *                                      Trusted breakdown (major units). When set, the bill layout renders
+ *                                      these verbatim and does NOT recompute from item prices — for bills
+ *                                      whose money an upstream owns (snackk: VAT-inclusive/promotions/udharo).
  * @property {string} [currency]        e.g. "Rs", "$". Default from config.
  * @property {string} [payment]         e.g. "Cash", "Card", "eSewa".
  * @property {string} [footer]
@@ -80,10 +87,12 @@ export function normalizeTicket(raw) {
     const qty = it.qty == null ? 1 : it.qty;
     if (!isFiniteNum(qty) || qty <= 0) throw new ValidationError(`items[${i}].qty must be a positive number`);
     if (it.price != null && (!isFiniteNum(it.price) || it.price < 0)) throw new ValidationError(`items[${i}].price must be >= 0`);
+    if (it.amount != null && (!isFiniteNum(it.amount) || it.amount < 0)) throw new ValidationError(`items[${i}].amount must be a number >= 0`);
     return {
       name: it.name.trim(),
       qty,
       price: it.price != null ? Number(it.price) : undefined,
+      amount: it.amount != null ? Number(it.amount) : undefined,
       modifiers: Array.isArray(it.modifiers) ? it.modifiers.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim()) : undefined,
       note: typeof it.note === 'string' && it.note.trim() ? it.note.trim() : undefined,
       voided: it.voided === true,
@@ -102,6 +111,23 @@ export function normalizeTicket(raw) {
   if (raw.revision != null && !isNonNegInt(raw.revision)) throw new ValidationError('ticket.revision must be a non-negative integer');
   if (raw.number != null && !isNonNegInt(raw.number)) throw new ValidationError('ticket.number must be a non-negative integer');
 
+  // A trusted breakdown (all five figures) supplied by an upstream that owns the
+  // money — validated whole, so a partial/garbage `totals` never half-prints.
+  let totals;
+  if (raw.totals != null) {
+    if (typeof raw.totals !== 'object') throw new ValidationError('ticket.totals must be an object');
+    for (const f of ['subtotal', 'discount', 'service', 'tax', 'total']) {
+      if (!isFiniteNum(raw.totals[f]) || raw.totals[f] < 0) throw new ValidationError(`ticket.totals.${f} must be a number >= 0`);
+    }
+    totals = {
+      subtotal: Number(raw.totals.subtotal),
+      discount: Number(raw.totals.discount),
+      service: Number(raw.totals.service),
+      tax: Number(raw.totals.tax),
+      total: Number(raw.totals.total),
+    };
+  }
+
   return {
     id: raw.id.trim(),
     revision: raw.revision != null ? raw.revision : 0,
@@ -119,6 +145,7 @@ export function normalizeTicket(raw) {
     taxLabel: typeof raw.taxLabel === 'string' ? raw.taxLabel : undefined,
     serviceCharge: raw.serviceCharge != null ? Number(raw.serviceCharge) : undefined,
     total: raw.total != null ? Number(raw.total) : undefined,
+    totals,
     currency: typeof raw.currency === 'string' ? raw.currency : undefined,
     payment: typeof raw.payment === 'string' ? raw.payment : undefined,
     footer: typeof raw.footer === 'string' ? raw.footer : undefined,

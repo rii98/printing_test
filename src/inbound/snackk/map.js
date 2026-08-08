@@ -152,3 +152,63 @@ export function printActionSeed(dto, config, printed) {
   if (!printing) return { action: 'skip', reason: 'kds-only' };
   return { action: 'print', reason: 'seed', ticket: orderTicketToTicket(dto), firstPrint: true };
 }
+
+/**
+ * Read a snackk NPR display string (server/domain/pricing.ts formatNPR, e.g.
+ * `रू 1,234.56` or `-रू 50.00`) as a Number in major units. We parse rather than
+ * print the string because the symbol is Devanagari and grouping is South-Asian —
+ * neither renders on a latin1 thermal printer — so the agent re-formats with its
+ * own ASCII currency. This does NOT recompute the bill: every figure is snackk's,
+ * printed as-is; the agent only changes how the SAME number is displayed.
+ * @param {string} s
+ * @returns {number}
+ */
+export function parseNpr(s) {
+  if (typeof s !== 'string') return 0;
+  const neg = s.trim().startsWith('-');
+  const n = Number(s.replace(/[^0-9.]/g, ''));
+  if (!Number.isFinite(n)) return 0;
+  return neg ? -n : n;
+}
+
+/**
+ * snackk BillDto → neutral cashier Ticket, for the settle-time receipt. The money
+ * is PASSED THROUGH, never recomputed: exact integer paisa where snackk exposes
+ * it (total, discount), the display strings parsed for the rest — snackk owns the
+ * VAT-inclusive / promotion / udharo math and the printed total must equal the
+ * counter's. Rendered via the bill layout's TRUSTED-breakdown path (`totals`),
+ * with per-line amounts trusted too (they include modifier deltas).
+ *
+ * id `bill:<sessionId>` @revision 0 → the durable idempotency store prints one
+ * receipt per settled tab even if the event is replayed after a reconnect.
+ * @param {import('./types').BillDto} bill
+ * @param {{currency?:string}} [opts]
+ * @returns {import('../../core/domain.js').Ticket}
+ */
+export function billToTicket(bill, { currency = 'Rs' } = {}) {
+  const vatRate = Number(bill.vatRate);
+  return {
+    id: `bill:${bill.sessionId}`,
+    revision: 0,
+    number: bill.billNumber ?? undefined,
+    station: 'cashier',
+    table: bill.tableLabel,
+    placedAt: bill.closedAt ?? bill.openedAt,
+    currency,
+    items: (Array.isArray(bill.lines) ? bill.lines : []).map((l) => ({
+      name: l.itemName,
+      qty: l.quantity,
+      amount: parseNpr(l.lineTotal),
+      modifiers: Array.isArray(l.modifiers) && l.modifiers.length ? l.modifiers.map((m) => m.name) : undefined,
+    })),
+    totals: {
+      subtotal: parseNpr(bill.subtotal),
+      // Exact paisa where snackk hands it over; the string parse is the fallback.
+      discount: typeof bill.discountPaisa === 'number' ? bill.discountPaisa / 100 : parseNpr(bill.discount),
+      service: parseNpr(bill.serviceCharge),
+      tax: parseNpr(bill.vat),
+      total: typeof bill.totalPaisa === 'number' ? bill.totalPaisa / 100 : parseNpr(bill.total),
+    },
+    taxLabel: Number.isFinite(vatRate) && vatRate > 0 ? `VAT ${vatRate}%` : undefined,
+  };
+}

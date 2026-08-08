@@ -16,9 +16,24 @@ const lineMinor = (it) => toMinor((it.price ?? 0) * (it.qty ?? 1));
  * Compute the money breakdown. Pure — unit-tested independently. All arithmetic
  * runs in integer minor units so the printed lines reconcile with the subtotal
  * and total to the paisa; the returned numbers are major units (unchanged shape).
+ *
+ * TRUSTED path: when the caller supplies `t.totals` (an upstream that owns the
+ * money — snackk's VAT-inclusive / promotion / udharo math), those figures are
+ * rendered VERBATIM and nothing is re-derived from item prices. Recomputing here
+ * would mismatch snackk's total, and the printed receipt must equal the counter's.
  */
 export function computeTotals(t) {
   const cur = t.currency ?? '';
+  if (t.totals) {
+    return {
+      cur,
+      subtotal: t.totals.subtotal,
+      discount: t.totals.discount,
+      service: t.totals.service,
+      tax: t.totals.tax,
+      total: t.totals.total,
+    };
+  }
   const subtotalMinor = t.items.filter((i) => !i.voided).reduce((s, i) => s + lineMinor(i), 0);
   const discountMinor = toMinor(t.discount ?? 0);
   const serviceMinor = toMinor(t.serviceCharge ?? 0);
@@ -54,9 +69,10 @@ export function billReceipt(t, { shopName = 'RECEIPT', shopLines = [] } = {}) {
   b.align('left');
   for (const it of t.items) {
     if (it.voided) continue;
-    // Format the SAME rounded minor-unit value that fed the subtotal, so the
-    // column of line totals always sums to the printed subtotal.
-    const lineTotal = money(fromMinor(lineMinor(it)), cur);
+    // A trusted line amount (upstream owns the line math, incl. modifiers) prints
+    // verbatim; otherwise format the SAME rounded minor-unit value that fed the
+    // subtotal, so the column of line totals always sums to the printed subtotal.
+    const lineTotal = it.amount != null ? money(it.amount, cur) : money(fromMinor(lineMinor(it)), cur);
     b.row(`${it.qty}x ${it.name}`, lineTotal);
     for (const m of it.modifiers ?? []) b.text(`   - ${m}`);
   }
