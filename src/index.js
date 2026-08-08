@@ -21,13 +21,20 @@ if (!cfg.auth.token) log.warn('AUTH DISABLED — /print is open to anyone on the
 // is the only path. A bad URL/key throws here, failing the boot loudly.
 let snackk = null;
 if (cfg.snackk.url && cfg.snackk.deviceKey) {
-  snackk = await startSnackkAgent({
-    baseUrl: cfg.snackk.url,
-    deviceKey: cfg.snackk.deviceKey,
-    service,
-    stations: cfg.snackk.stations,
-    log,
-  });
+  // The snackk inbound is best-effort: startSnackkAgent no longer throws for a
+  // disabled/unreachable tenant, but guard anyway so NOTHING about the optional
+  // upstream can ever stop the local HTTP inbound from listening below.
+  try {
+    snackk = await startSnackkAgent({
+      baseUrl: cfg.snackk.url,
+      deviceKey: cfg.snackk.deviceKey,
+      service,
+      stations: cfg.snackk.stations,
+      log,
+    });
+  } catch (err) {
+    log.error('snackk integration failed to start — continuing with local HTTP inbound only', { error: String(err.message || err) });
+  }
 } else {
   log.info('snackk integration off (set SNACKK_URL + SNACKK_DEVICE_KEY to enable)');
 }

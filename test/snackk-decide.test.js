@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { printAction } from '../src/inbound/snackk/map.js';
+import { printAction, printActionSeed } from '../src/inbound/snackk/map.js';
 
 const dto = (over = {}) => ({
   orderId: 'o1', station: 'kitchen', state: 'received', ticketNumber: 1,
@@ -45,4 +45,21 @@ test('a void prints a slip only if the KOT was already printed', () => {
   assert.equal(d.action, 'print');
   assert.equal(d.reason, 'void');
   assert.equal(d.ticket.voided, true);
+});
+
+test('seed prints any board ticket (even a bumped one), gated on delivery mode', () => {
+  // A board ticket is at or past its fire state, so seed prints it regardless of
+  // state — this is how a KOT missed while disconnected (already bumped to
+  // preparing by a human) still comes out. The durable store dedupes a re-seed.
+  const received = printActionSeed(dto({ state: 'received' }), CFG, new Set());
+  assert.equal(received.action, 'print');
+  assert.equal(received.reason, 'seed');
+  assert.equal(received.firstPrint, true);
+
+  const bumped = printActionSeed(dto({ state: 'preparing' }), CFG, new Set());
+  assert.equal(bumped.action, 'print', 'a bumped board ticket the agent never printed is a missed KOT');
+
+  const kds = printActionSeed(dto(), { ...CFG, stationDelivery: 'kds' }, new Set());
+  assert.equal(kds.action, 'skip');
+  assert.equal(kds.reason, 'kds-only');
 });

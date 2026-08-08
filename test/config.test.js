@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadConfig } from '../src/config.js';
+import { loadConfig, printerStations } from '../src/config.js';
 
 // Run loadConfig() with a temporary set of env overrides, then restore whatever
 // was there before — tests must never leak process.env state into each other.
@@ -57,4 +57,20 @@ test('grace of 0 (drain-then-exit-immediately) is a valid choice', () => {
   withEnv({ PRINT_SHUTDOWN_GRACE_MS: '0' }, () => {
     assert.equal(loadConfig().shutdown.graceMs, 0);
   });
+});
+
+test('the single POS-8360 serves all three stations from one printer/queue', () => {
+  const cfg = loadConfig();
+  // One entry, one queue — so cashier, kitchen and bar share the printer's single
+  // 9100 connection instead of three queues contending on it.
+  assert.equal(cfg.stationToPrinter.cashier, 'pos');
+  assert.equal(cfg.stationToPrinter.kitchen, 'pos');
+  assert.equal(cfg.stationToPrinter.bar, 'pos');
+  assert.equal(Object.keys(cfg.printers).length, 1);
+});
+
+test('printerStations normalizes both `stations: [...]` and a single `station`', () => {
+  assert.deepEqual(printerStations({ stations: ['a', 'b'] }), ['a', 'b']);
+  assert.deepEqual(printerStations({ station: 'a' }), ['a']);
+  assert.deepEqual(printerStations({}), []);
 });

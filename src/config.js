@@ -50,12 +50,16 @@ function defaults() {
     // in snackk's Settings (POST /api/settings/printer-device).
     snackk: { url: null, deviceKey: null, stations: ['kitchen', 'bar'] },
 
-    // printerId -> printer. station links a ticket to a printer.
+    // printerId -> printer. A printer serves one or more STATIONS (a ticket's
+    // station routes it to a printer); use `station` for one or `stations` for
+    // several. This shop has ONE POS-8360, so the single device serves cashier,
+    // kitchen AND bar — one entry, one queue, so the three stations share the
+    // printer's single 9100 connection instead of three queues fighting over it.
     printers: {
-      cashier: { station: 'cashier', host: '192.168.18.240', mac: '02:1f:e0:13:19:28', port: 9100, width: 48, encoding: 'latin1', cut: true, cutFeed: 7 },
-      // Add when you plug them in — host OR mac is enough:
+      pos: { stations: ['cashier', 'kitchen', 'bar'], host: '192.168.18.240', mac: '02:1f:e0:13:19:28', port: 9100, width: 48, encoding: 'latin1', cut: true, cutFeed: 7 },
+      // A second physical printer? Give it its own entry and its own stations —
+      // host OR mac is enough — and drop those stations from `pos` above:
       // kitchen: { station: 'kitchen', mac: 'aa:bb:cc:dd:ee:ff', width: 48 },
-      // bar:     { station: 'bar',     mac: '11:22:33:44:55:66', width: 48 },
     },
   };
 }
@@ -98,13 +102,23 @@ function merge(base, over) {
   return out;
 }
 
+/** A printer's stations, normalized: accepts `stations: [...]` or a single `station`. */
+export function printerStations(p) {
+  if (Array.isArray(p.stations)) return p.stations;
+  if (p.station) return [p.station];
+  return [];
+}
+
 export function loadConfig() {
   const cfg = applyEnv(merge(defaults(), loadFile()));
-  // Derived: station -> printerId. Reject two printers claiming one station.
+  // Derived: station -> printerId. One printer may serve several stations, but a
+  // station maps to exactly one printer — reject two printers claiming the same.
   cfg.stationToPrinter = {};
   for (const [id, p] of Object.entries(cfg.printers)) {
-    if (cfg.stationToPrinter[p.station]) throw new Error(`two printers claim station "${p.station}": ${cfg.stationToPrinter[p.station]} and ${id}`);
-    cfg.stationToPrinter[p.station] = id;
+    for (const station of printerStations(p)) {
+      if (cfg.stationToPrinter[station]) throw new Error(`two printers claim station "${station}": ${cfg.stationToPrinter[station]} and ${id}`);
+      cfg.stationToPrinter[station] = id;
+    }
   }
   return cfg;
 }

@@ -131,3 +131,24 @@ export function printAction(dto, config, printed) {
 
   return { action: 'skip', reason: 'not-fire' };
 }
+
+/**
+ * Decide what to do with one ticket from a station-board SEED snapshot (fetched
+ * on (re)connect, see subscribe.js). Unlike the live stream — which fires only on
+ * the single fire-state event — every ticket on a board is at or PAST its fire
+ * state by construction (stationBoardStates), so any board ticket the agent
+ * hasn't printed is a KOT it missed while disconnected: print it. The durable
+ * id@0 idempotency store makes a re-seed of an already-printed ticket a no-op, so
+ * seeding on every reconnect stays exactly-once. Voids never appear on a board,
+ * so there is no void case here.
+ *
+ * @param {{orderId:string, state:string}} dto
+ * @param {{stationDelivery:'kds'|'print'|'both'}} config
+ * @param {{has:(k:string)=>boolean, add:(k:string)=>void}} printed
+ * @returns {{action:'print'|'skip', reason:string, ticket?:import('../../core/domain.js').Ticket, firstPrint?:boolean}}
+ */
+export function printActionSeed(dto, config, printed) {
+  const printing = config.stationDelivery === 'print' || config.stationDelivery === 'both';
+  if (!printing) return { action: 'skip', reason: 'kds-only' };
+  return { action: 'print', reason: 'seed', ticket: orderTicketToTicket(dto), firstPrint: true };
+}

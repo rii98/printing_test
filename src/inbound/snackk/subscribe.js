@@ -13,9 +13,35 @@
 
 import { createSseParser } from './sse-parse.js';
 import { createConfigClient } from './config.js';
-import { printAction } from './map.js';
+import { printAction, printActionSeed } from './map.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * A Set of orderIds bounded to the most recent `limit`, oldest evicted (FIFO).
+ * It only records "this KOT printed, so a later void should print a VOID slip" —
+ * a void arrives seconds to minutes after the fire, never days, so a bounded
+ * window loses nothing real while a plain Set would grow for the life of the box.
+ * (It is in-memory: a restart forgets, so a void landing AFTER a restart of an
+ * order that fired BEFORE it won't emit a VOID slip — an accepted, rare gap; a
+ * missing VOID is far less bad than a missing KOT, which the seed path covers.)
+ * @param {number} [limit]
+ * @returns {{has:(k:string)=>boolean, add:(k:string)=>void, size:()=>number}}
+ */
+export function boundedSet(limit = 2000) {
+  const seen = new Set();
+  const order = [];
+  return {
+    has: (k) => seen.has(k),
+    add(k) {
+      if (seen.has(k)) return;
+      seen.add(k);
+      order.push(k);
+      while (order.length > limit) seen.delete(order.shift());
+    },
+    size: () => seen.size,
+  };
+}
 
 /**
  * Drive one station's feed. Returns a handle with stop().
@@ -32,19 +58,53 @@ export function subscribeStation({
   let lastEventId;
   let attempt = 0;
 
-  async function handle(dto) {
-    const cfg = getConfig();
-    if (!cfg) return; // config not loaded yet — drop; a live ticket will follow
-    const decision = printAction(dto, cfg, printed);
+  // Execute a print decision and remember a first KOT/BOT so a later void of it
+  // prints a slip (a void of a never-fired ticket stays silent). Only on a real
+  // accept, so a transient failure we retry later still counts as "not yet
+  // printed". Shared by the live stream and the seed path.
+  async function applyDecision(dto, decision) {
     if (decision.action !== 'print') return;
     const result = await service.print(decision.ticket);
-    // Remember a first KOT/BOT so a later void of it prints a slip (and a void of
-    // a never-fired ticket stays silent). Only on a real accept, so a transient
-    // failure that we retry later still counts as "not yet printed".
     if (decision.firstPrint && (result.status === 'queued' || result.status === 'duplicate')) {
       printed.add(dto.orderId);
     }
     log.info?.(`[snackk] ${station} ${dto.orderId} → ${result.status} (${decision.reason})`);
+  }
+
+  async function handle(dto) {
+    const cfg = getConfig();
+    if (!cfg) return; // config not loaded yet — drop; a live ticket will follow
+    await applyDecision(dto, printAction(dto, cfg, printed));
+  }
+
+  // Seed on (re)connect: the live stream only fires on the fire-state EVENT, and
+  // the hub's replay buffer is bounded and dropped when the channel's last
+  // subscriber leaves — so a KOT that fired while this agent was disconnected (or
+  // while it was the only subscriber, in print-only mode) would never print. Pull
+  // the current board and print anything not already in the durable store, which
+  // dedupes so a re-seed never reprints.
+  async function seedActive() {
+    const cfg = getConfig();
+    if (!cfg) return; // no config yet — the config poll + a live event will cover it
+    let tickets;
+    try {
+      const res = await fetchImpl(`${baseUrl}/api/print/station/${station}/active`, {
+        headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
+      });
+      if (!res.ok) throw new Error(`active → HTTP ${res.status}`);
+      ({ tickets } = await res.json());
+    } catch (err) {
+      // Non-fatal: a live event or the next reconnect's seed still covers it.
+      log.warn?.(`[snackk] ${station} seed failed: ${err.message}`);
+      return;
+    }
+    for (const dto of Array.isArray(tickets) ? tickets : []) {
+      try {
+        await applyDecision(dto, printActionSeed(dto, cfg, printed));
+      } catch (err) {
+        log.warn?.(`[snackk] ${station} bad seed ticket: ${err.message}`);
+      }
+    }
   }
 
   async function connectOnce() {
@@ -54,6 +114,9 @@ export function subscribeStation({
     if (!res.ok || !res.body) throw new Error(`stream → HTTP ${res.status}`);
     attempt = 0; // connected — reset the backoff ladder
     log.info?.(`[snackk] subscribed ${station}`);
+    // Seed before draining the live stream: any event that lands meanwhile is
+    // read right after and deduped by the durable store, so the overlap is safe.
+    await seedActive();
     const parser = createSseParser();
     const reader = res.body.getReader();
     const dec = new TextDecoder();
@@ -100,8 +163,11 @@ export async function startSnackkAgent({
   baseUrl, deviceKey, service, stations = ['kitchen', 'bar'], log = console, fetchImpl = fetch,
 }) {
   const config = createConfigClient({ baseUrl, deviceKey, fetchImpl, log });
-  await config.start(); // throws if URL/key are wrong — fail fast at boot
-  const printed = new Set();
+  // Never throws: an unreachable snackk or a not-yet-enabled tenant must not take
+  // down the local HTTP inbound. It logs and keeps polling; the agent starts
+  // delivering the moment the config comes good.
+  await config.start();
+  const printed = boundedSet();
   const subs = stations.map((station) =>
     subscribeStation({ baseUrl, deviceKey, station, service, getConfig: () => config.get(), printed, log, fetchImpl }),
   );

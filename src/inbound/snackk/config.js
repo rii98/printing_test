@@ -17,14 +17,29 @@ export function createConfigClient({ baseUrl, deviceKey, refreshMs = 30_000, fet
     const res = await fetchImpl(`${baseUrl}/api/print/config`, {
       headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
     });
-    if (!res.ok) throw new Error(`config → HTTP ${res.status}`);
+    if (!res.ok) {
+      const e = new Error(`config → HTTP ${res.status}`);
+      e.status = res.status;
+      throw e;
+    }
     return res.json();
   }
 
   return {
-    /** Load the first config (throws on failure) and begin periodic refresh. */
+    /**
+     * Load the first config and begin periodic refresh. Does NOT throw: a snackk
+     * that's unreachable or a tenant that hasn't enabled `printing` yet must not
+     * crash the appliance (the local HTTP inbound has to keep printing). It warns
+     * — loudly for a rejected key, which needs the owner to re-mint one — and
+     * keeps polling, so delivery begins the moment the config comes good.
+     */
     async start() {
-      cached = await fetchOnce();
+      try {
+        cached = await fetchOnce();
+      } catch (e) {
+        if (e.status === 401) log.warn?.(`[snackk] device key rejected (401) — re-mint it in Settings; will keep retrying`);
+        else log.warn?.(`[snackk] config unavailable (${e.message}) — keeping local printing, will retry`);
+      }
       timer = setInterval(async () => {
         try {
           cached = await fetchOnce();

@@ -13,6 +13,7 @@ import { memoryStore } from './adapters/store/memory.js';
 import { fileIdempotency } from './adapters/store/idempotency-file.js';
 import { memoryIdempotency } from './core/idempotency.js';
 import { discoverPrinters, normalizeMac, resolveHostMac } from './adapters/discovery/scan.js';
+import { printerStations } from './config.js';
 import { logEvent, log } from './logger.js';
 
 /**
@@ -53,13 +54,14 @@ export async function buildService(cfg, { onEvent = logEvent } = {}) {
 
   const printers = new Map();
   for (const [id, p] of Object.entries(cfg.printers)) {
+    const stations = printerStations(p);
     const host = (p.mac && macToIp.get(normalizeMac(p.mac))) || p.host || null;
-    if (!host) { log.error(`printer "${id}" has no address (mac not found, no host) — station "${p.station}" will not print`, {}); continue; }
+    if (!host) { log.error(`printer "${id}" has no address (mac not found, no host) — station(s) "${stations.join(', ')}" will not print`, {}); continue; }
     const transport = tcpTransport({ host, port: p.port ?? 9100 });
     const queue = new PrinterQueue({ printerId: id, transport, store, onEvent, policy: cfg.policy });
     await queue.recover();
     printers.set(id, { queue, width: p.width ?? 48, encoding: p.encoding ?? 'latin1', cut: p.cut !== false, cutFeed: p.cutFeed, docKind: p.docKind });
-    log.info(`printer "${id}" -> ${transport.describe}`, { station: p.station, source: p.mac && macToIp.get(normalizeMac(p.mac)) ? 'discovered' : 'configured' });
+    log.info(`printer "${id}" -> ${transport.describe}`, { stations, source: p.mac && macToIp.get(normalizeMac(p.mac)) ? 'discovered' : 'configured' });
   }
 
   // Hydrate idempotency from jobs that outlived the last run: a still-pending or
