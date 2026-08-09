@@ -222,6 +222,10 @@ export function billToTicket(bill, { currency = 'Rs' } = {}) {
     table: bill.tableLabel,
     placedAt: bill.closedAt ?? bill.openedAt,
     currency,
+    // The issuer identity rides WITH the bill — the receipt prints who the bill
+    // says issued it, never a name configured on the box. (snackk billIssuerDto.)
+    shopName: cleanStr(bill.restaurant?.name),
+    shopLines: bill.restaurant?.panNumber ? [`PAN ${bill.restaurant.panNumber}`] : undefined,
     items: (Array.isArray(bill.lines) ? bill.lines : []).map((l) => ({
       name: l.itemName,
       qty: l.quantity,
@@ -236,6 +240,40 @@ export function billToTicket(bill, { currency = 'Rs' } = {}) {
       tax: parseNpr(bill.vat),
       total: typeof bill.totalPaisa === 'number' ? bill.totalPaisa / 100 : parseNpr(bill.total),
     },
-    taxLabel: Number.isFinite(vatRate) && vatRate > 0 ? `VAT ${vatRate}%` : undefined,
+    taxLabel: Number.isFinite(vatRate) && vatRate > 0 ? `VAT (${vatRate}%)` : undefined,
+    fiscal: mapFiscal(bill.fiscal),
+  };
+}
+
+const cleanStr = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+
+/** The legal-document banner, matching snackk's own printInvoice.ts titles. */
+const DOC_TITLES = {
+  tax_invoice: 'TAX INVOICE',
+  abbreviated_invoice: 'ABBREVIATED TAX INVOICE',
+  credit_note: 'CREDIT NOTE',
+};
+
+/**
+ * snackk billPrintFiscalDto → our neutral Fiscal. Present only when accounting
+ * issued a document for the settled session; when absent (accounting off) the
+ * bill layout falls back to the plain settle slip. Paisa → major units here so the
+ * layout formats the same way it does every other figure.
+ * @param {any} f  bill.fiscal, or null/undefined
+ */
+export function mapFiscal(f) {
+  if (!f || typeof f !== 'object') return undefined;
+  return {
+    docTitle: DOC_TITLES[f.docType] ?? undefined,
+    invoiceNo: cleanStr(f.displayNumber),
+    dateBs: cleanStr(f.dateBs),
+    dateAd: cleanStr(f.dateAd),
+    taxable: typeof f.taxablePaisa === 'number' ? f.taxablePaisa / 100 : undefined,
+    payments: Array.isArray(f.payments)
+      ? f.payments.map((p) => ({
+          label: cleanStr(p.label) ?? '',
+          amount: typeof p.amountPaisa === 'number' ? p.amountPaisa / 100 : 0,
+        }))
+      : undefined,
   };
 }

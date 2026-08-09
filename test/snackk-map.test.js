@@ -143,13 +143,46 @@ test('billToTicket → a valid cashier Ticket, money passed through verbatim', (
   assert.equal(t.items[0].name, 'Chicken Momo (Full)');
   assert.equal(t.items[0].amount, 265.49);
   assert.deepEqual(t.items[0].modifiers, ['Extra spicy']);
-  assert.equal(t.taxLabel, 'VAT 13%');
+  assert.equal(t.taxLabel, 'VAT (13%)');
+  // Identity travels WITH the bill — the receipt prints the restaurant, not config.
+  assert.equal(t.shopName, 'Momo House');
+  assert.deepEqual(t.shopLines, ['PAN 123456789']);
   // The trusted breakdown is exactly snackk's — discount/total from exact paisa.
   const c = computeTotals(t);
   assert.deepEqual(
     { subtotal: c.subtotal, discount: c.discount, service: c.service, tax: c.tax, total: c.total },
     { subtotal: 265.49, discount: 15.49, service: 25, tax: 32.5, total: 307.5 },
   );
+});
+
+test('billToTicket carries the fiscal document facts when accounting issued one', () => {
+  const t = normalizeTicket(billToTicket(billDto({
+    fiscal: {
+      docType: 'abbreviated_invoice',
+      displayNumber: '2083/84-000042',
+      dateBs: '2083-04-24',
+      dateAd: '2026-08-09',
+      taxablePaisa: 25000,
+      payments: [
+        { label: 'Cash', amountPaisa: 10000 },
+        { label: 'Khalti', amountPaisa: 20750 },
+      ],
+    },
+  })));
+  assert.equal(t.fiscal.docTitle, 'ABBREVIATED TAX INVOICE');
+  assert.equal(t.fiscal.invoiceNo, '2083/84-000042');
+  assert.equal(t.fiscal.dateBs, '2083-04-24');
+  assert.equal(t.fiscal.dateAd, '2026-08-09');
+  assert.equal(t.fiscal.taxable, 250);
+  assert.deepEqual(t.fiscal.payments, [
+    { label: 'Cash', amount: 100 },
+    { label: 'Khalti', amount: 207.5 },
+  ]);
+});
+
+test('billToTicket without a fiscal block → a plain receipt (no fiscal on the ticket)', () => {
+  const t = normalizeTicket(billToTicket(billDto()));
+  assert.equal(t.fiscal, undefined);
 });
 
 test('billToTicket prefers exact paisa over the display string for total/discount', () => {

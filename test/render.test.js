@@ -70,6 +70,44 @@ test('trusted breakdown renders upstream totals verbatim, never recomputed from 
   assert.match(txt, /VAT 13%\s+Rs 32\.50/);
 });
 
+test('a fiscal bill prints the full tax-invoice layout, matching the browser', () => {
+  // The receipt the on-prem printer must produce, byte-parity with the counter's
+  // browser ABBREVIATED TAX INVOICE: issuer + PAN, banner, fiscal meta, the
+  // taxable/VAT split, and the tender breakdown.
+  const bill = normalizeTicket({
+    id: 'bill:s2', station: 'cashier', currency: 'Rs', table: 'Table Y',
+    shopName: 'Alchemist', shopLines: ['PAN 123456789'],
+    items: [
+      { name: 'Jack Denials (Half)', qty: 1, amount: 2500, modifiers: ['water'] },
+      { name: 'Black Label 1 Quater', qty: 1, amount: 2310 },
+    ],
+    totals: { subtotal: 4256.64, discount: 150, service: 0, tax: 533.86, total: 4640.5 },
+    taxLabel: 'VAT (13%)',
+    fiscal: {
+      docTitle: 'ABBREVIATED TAX INVOICE', invoiceNo: '2083/84-000042',
+      dateBs: '2083-04-24', dateAd: '2026-08-09', taxable: 4106.64,
+      payments: [{ label: 'Cash', amount: 2040.5 }, { label: 'Khalti', amount: 2600 }],
+    },
+  });
+  const txt = toText(renderTicket(bill));
+  assert.match(txt, /Alchemist/i); // bold header; the text preview upper-cases it
+  assert.match(txt, /PAN 123456789/);
+  assert.match(txt, /ABBREVIATED TAX INVOICE/);
+  assert.match(txt, /Invoice no\.\s+2083\/84-000042/);
+  assert.match(txt, /Date \(BS\)\s+2083-04-24/);
+  assert.match(txt, /Date \(AD\)\s+2026-08-09/);
+  assert.match(txt, /Taxable amount\s+Rs 4106\.64/);
+  assert.match(txt, /VAT \(13%\)\s+Rs 533\.86/);
+  assert.match(txt, /Total\s+RS 4640\.50/i);
+  assert.match(txt, /Paid - Cash\s+Rs 2040\.50/);
+  assert.match(txt, /Paid - Khalti\s+Rs 2600\.00/);
+  assert.match(txt, /Printed on/);
+  assert.match(txt, /Thank you!/);
+  // It must NOT fall back to the plain slip's markers.
+  assert.doesNotMatch(txt, /Bill #/);
+  assert.doesNotMatch(txt, /NAMASTE MINI MARKET/);
+});
+
 test('a partial/garbage trusted totals block is rejected whole (never half-prints)', () => {
   assert.throws(
     () => normalizeTicket({ id: 'b', station: 'cashier', items: [{ name: 'x', qty: 1, price: 1 }], totals: { subtotal: 10 } }),

@@ -8,6 +8,9 @@ import { money } from '../format.js';
 import { toMinor, fromMinor, applyRate } from '../../money.js';
 
 const fmtTime = (v) => { try { return v ? new Date(v).toLocaleString() : ''; } catch { return ''; } };
+// The true moment this copy came off the printer, en-GB so it reads dd/mm/yyyy —
+// the same "Printed on …" stamp the browser invoice carries.
+const fmtNow = () => { try { return new Date().toLocaleString('en-GB'); } catch { return ''; } };
 
 /** A single line's charge, rounded to the minor unit exactly once. */
 const lineMinor = (it) => toMinor((it.price ?? 0) * (it.qty ?? 1));
@@ -53,20 +56,40 @@ export function computeTotals(t) {
 
 /**
  * @param {import('../../domain.js').Ticket} t
- * @param {{shopName?:string, shopLines?:string[]}} [opts]
+ * @param {{shopName?:string, shopLines?:string[]}} [opts]  config branding — a
+ *   FALLBACK only. A bill that carries its own `shopName`/`shopLines` (snackk's
+ *   issuer identity, which travels with the bill) always wins, so a name
+ *   configured on the box can never override the real restaurant on the receipt.
  */
-export function billReceipt(t, { shopName = 'RECEIPT', shopLines = [] } = {}) {
+export function billReceipt(t, opts = {}) {
   const { cur, subtotal, discount, service, tax, total } = computeTotals(t);
+  const fiscal = t.fiscal;
   const b = new DocBuilder();
+
+  const shopName = t.shopName ?? opts.shopName ?? 'RECEIPT';
+  const shopLines = (t.shopLines && t.shopLines.length ? t.shopLines : opts.shopLines) ?? [];
 
   b.align('center').text(shopName, { bold: true, doubleH: true });
   for (const l of shopLines) b.text(l);
-  if (t.number != null) b.text(`Bill #${t.number}`);
-  if (t.table) b.text(`Table ${t.table}`);
-  if (t.placedAt) b.text(fmtTime(t.placedAt));
+
+  if (fiscal) {
+    // A legal tax-invoice receipt: banner + the fiscal meta block, matching the
+    // counter's browser invoice (Invoice no. / Date BS / Date AD / Table).
+    if (fiscal.docTitle) b.text(fiscal.docTitle, { bold: true });
+    b.align('left');
+    if (fiscal.invoiceNo) b.row('Invoice no.', fiscal.invoiceNo);
+    if (fiscal.dateBs) b.row('Date (BS)', fiscal.dateBs);
+    if (fiscal.dateAd) b.row('Date (AD)', fiscal.dateAd);
+    if (t.table) b.row('Table', t.table);
+  } else {
+    // The plain settle slip: bill number, table, and the settle time.
+    if (t.number != null) b.text(`Bill #${t.number}`);
+    if (t.table) b.text(`Table ${t.table}`);
+    if (t.placedAt) b.text(fmtTime(t.placedAt));
+    b.align('left');
+  }
   b.rule('=');
 
-  b.align('left');
   for (const it of t.items) {
     if (it.voided) continue;
     // A trusted line amount (upstream owns the line math, incl. modifiers) prints
@@ -79,15 +102,33 @@ export function billReceipt(t, { shopName = 'RECEIPT', shopLines = [] } = {}) {
   b.rule('-');
 
   b.row('Subtotal', money(subtotal, cur));
-  if (discount) b.row('Discount', `- ${money(discount, cur)}`);
-  if (service) b.row('Service', money(service, cur));
-  if (tax) b.row(t.taxLabel ?? `Tax`, money(tax, cur));
-  b.rule('-');
-  b.row('TOTAL', money(total, cur), { bold: true, doubleH: true });
-  if (t.payment) b.row('Paid', t.payment);
+  if (fiscal) {
+    // Fiscal parity with the browser: a plain (non-negative) discount line, the
+    // explicit taxable base, then VAT — the split a tax invoice must show.
+    if (discount) b.row('Discount', money(discount, cur));
+    const taxable = fiscal.taxable != null ? fiscal.taxable : Math.max(0, subtotal - discount);
+    b.row('Taxable amount', money(taxable, cur));
+    if (service) b.row('Service charge', money(service, cur));
+    if (tax) b.row(t.taxLabel ?? 'VAT', money(tax, cur));
+    b.rule('-');
+    b.row('Total', money(total, cur), { bold: true });
+    for (const p of fiscal.payments ?? []) b.row(`Paid - ${p.label}`, money(p.amount, cur));
+  } else {
+    if (discount) b.row('Discount', `- ${money(discount, cur)}`);
+    if (service) b.row('Service', money(service, cur));
+    if (tax) b.row(t.taxLabel ?? `Tax`, money(tax, cur));
+    b.rule('-');
+    b.row('TOTAL', money(total, cur), { bold: true, doubleH: true });
+    if (t.payment) b.row('Paid', t.payment);
+  }
 
   if (t.qr) b.feed(1).qr(t.qr);
-  if (t.footer) b.feed(1).align('center').text(t.footer);
+  if (fiscal) {
+    b.feed(1).align('center').text(`Printed on ${fmtNow()}`);
+    b.text(t.footer ?? 'Thank you!');
+  } else if (t.footer) {
+    b.feed(1).align('center').text(t.footer);
+  }
   b.feed(1).cut();
   if (t.openDrawer) b.drawer();
   return b.build();

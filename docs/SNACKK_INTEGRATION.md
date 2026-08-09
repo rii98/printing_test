@@ -711,6 +711,20 @@ string (`रू 1,951.51`) is **parsed** (not recomputed) into the same number a
 re-rendered as ASCII `Rs`. Verified: `parseNpr("रू 1,951.51") === 1951.51`. If
 snackk ever changes `formatNPR` to non-Latin digits, revisit this.
 
+### 11.5b Fiscal receipt parity (the ABBREVIATED TAX INVOICE)
+`src/inbound/snackk/map.js` (`billToTicket`, `mapFiscal`) + `src/core/render/layouts/bill.js`.
+When accounting issued a legal document for the settled session, snackk's `bill.print`
+payload carries a `fiscal` block (`billPrintFiscalDto`): `docType`, `displayNumber`,
+`dateBs`, `dateAd`, `taxablePaisa`, and the `payments` tender split (label + paisa) —
+all read from the SAME tax document the browser invoice prints, so paper and screen
+can't drift. The bill layout then renders the full invoice: issuer + `PAN`, the
+document banner, the fiscal meta block (`Invoice no.` / `Date (BS)` / `Date (AD)` /
+`Table`), the `Taxable amount` / `VAT` split, the per-tender `Paid - …` lines, and a
+`Printed on … / Thank you!` footer. **The issuer name travels WITH the bill**
+(`bill.restaurant.name` → `shopName`); the config `SHOP_NAME` is only a fallback for
+the local HTTP inbound, never for a snackk bill. When `fiscal` is absent (accounting
+off), the layout falls back to the plain settle slip (Bill # / time / totals).
+
 ### 11.6 Boot ordering
 `src/index.js`. `app.listen` binds **before** the snackk agent starts (agent runs
 in the background), so the local HTTP inbound is never blocked by a slow cloud.

@@ -42,7 +42,23 @@
  *                                      whose money an upstream owns (snackk: VAT-inclusive/promotions/udharo).
  * @property {string} [currency]        e.g. "Rs", "$". Default from config.
  * @property {string} [payment]         e.g. "Cash", "Card", "eSewa".
+ * @property {string} [shopName]        The issuer's name, carried WITH the bill so the receipt
+ *                                      can't be handed the wrong one (falls back to config branding).
+ * @property {string[]} [shopLines]     Sub-header lines under the name (e.g. "PAN 123456789").
+ * @property {Fiscal} [fiscal]          Legal-document facts for a tax-invoice receipt (see below).
  * @property {string} [footer]
+ *
+ * @typedef {Object} FiscalPayment
+ * @property {string} label             Tender label as printed ("Cash", "Khalti", "Udharo").
+ * @property {number} amount            Amount in major units.
+ *
+ * @typedef {Object} Fiscal
+ * @property {string} [docTitle]        e.g. "ABBREVIATED TAX INVOICE".
+ * @property {string} [invoiceNo]       The legal number, e.g. "2083/84-000042".
+ * @property {string} [dateBs]          Bikram Sambat issue date.
+ * @property {string} [dateAd]          Gregorian issue date.
+ * @property {number} [taxable]         The VAT base (subtotal − discount + service), major units.
+ * @property {FiscalPayment[]} [payments]  The tender split.
  * @property {string} [qr]              QR payload (URL, invoice ref…).
  * @property {boolean} [openDrawer]     Kick the cash drawer after a bill.
  */
@@ -63,6 +79,36 @@ export class ValidationError extends Error {
 
 const isFiniteNum = (v) => typeof v === 'number' && Number.isFinite(v);
 const isNonNegInt = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+const cleanStr = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+
+/**
+ * Tolerant normalizer for the OPTIONAL fiscal block on a cashier bill. Unlike the
+ * core ticket fields, a malformed enrichment must NEVER reject the whole receipt —
+ * a bill that can't carry its invoice number should still print as a plain slip.
+ * So this coerces what it can and returns undefined for anything unusable, never
+ * throwing. Only our own snackk adapter populates it, from a validated payload.
+ * @param {any} raw
+ * @returns {import('./domain.js').Fiscal|undefined}
+ */
+function normalizeFiscal(raw) {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const payments = Array.isArray(raw.payments)
+    ? raw.payments
+        .filter((p) => p && typeof p === 'object' && cleanStr(p.label) && isFiniteNum(p.amount))
+        .map((p) => ({ label: p.label.trim(), amount: Number(p.amount) }))
+    : undefined;
+  const fiscal = {
+    docTitle: cleanStr(raw.docTitle),
+    invoiceNo: cleanStr(raw.invoiceNo),
+    dateBs: cleanStr(raw.dateBs),
+    dateAd: cleanStr(raw.dateAd),
+    taxable: isFiniteNum(raw.taxable) ? Number(raw.taxable) : undefined,
+    payments: payments && payments.length ? payments : undefined,
+  };
+  // Drop the block entirely if nothing survived — the layout treats absence as
+  // "plain receipt", so an empty husk would just print a bare title-less slip.
+  return Object.values(fiscal).some((v) => v !== undefined) ? fiscal : undefined;
+}
 
 /**
  * Validate + normalize an untrusted ticket into a clean, defaulted Ticket.
@@ -148,6 +194,11 @@ export function normalizeTicket(raw) {
     totals,
     currency: typeof raw.currency === 'string' ? raw.currency : undefined,
     payment: typeof raw.payment === 'string' ? raw.payment : undefined,
+    shopName: cleanStr(raw.shopName),
+    shopLines: Array.isArray(raw.shopLines)
+      ? raw.shopLines.filter((l) => typeof l === 'string' && l.trim()).map((l) => l.trim())
+      : undefined,
+    fiscal: normalizeFiscal(raw.fiscal),
     footer: typeof raw.footer === 'string' ? raw.footer : undefined,
     qr: typeof raw.qr === 'string' ? raw.qr : undefined,
     openDrawer: raw.openDrawer === true,
