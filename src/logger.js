@@ -32,6 +32,10 @@ export function logEvent(evt) {
     case 'store-error': log.error(`STORE ERROR during ${evt.op} (job kept safe; may reprint on restart)`, { printer: evt.printerId, jobId: evt.jobId, error: evt.error }); break;
     case 'duplicate': log.info(`skipped duplicate`, { key: evt.key }); break;
     case 'rejected': log.warn(`rejected invalid ticket`, { error: evt.error }); break;
+    // Routing/render/enqueue failures from PrintService.print (e.g. no printer
+    // configured for a ticket's station). Without this they hit default and
+    // vanish, leaving only the caller's bare "→ error" with no reason.
+    case 'error': log.error(`print failed`, { error: evt.error }); break;
     default: break;
   }
 }

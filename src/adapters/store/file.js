@@ -7,6 +7,24 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+/**
+ * Make a job id safe to use as a filename on EVERY platform. A ticket key can
+ * contain characters that are legal on macOS/Linux but ILLEGAL on Windows —
+ * notably ':' (NTFS reads `name:x` as an alternate-data-stream), which appears in
+ * our `bill:<id>@0` and `<id>@0:void` keys. Left raw, the atomic rename fails with
+ * EINVAL on Windows and the bill/void slip is never queued, while colon-free
+ * KOT/BOT keys (`<id>@0`) work — the exact "kitchen works, billing/void don't"
+ * split seen only on the Windows box.
+ *
+ * We percent-encode the Windows-reserved set (and '%' itself, so the mapping is
+ * injective — no two distinct keys collide onto one file). The true id is stored
+ * INSIDE the JSON, so list()/recovery read the real key regardless of the on-disk
+ * name; this only changes the filename. Keys with none of these characters (every
+ * existing KOT file) encode to themselves, so old pending files still load.
+ */
+const safeName = (id) =>
+  String(id).replace(/[%<>:"/\\|?*\x00-\x1f]/g, (c) => '%' + c.charCodeAt(0).toString(16).padStart(2, '0').toUpperCase());
+
 export async function fileStore(dir) {
   const pendingDir = path.join(dir, 'pending');
   const deadDir = path.join(dir, 'dead');
@@ -18,7 +36,7 @@ export async function fileStore(dir) {
     await fs.writeFile(tmp, JSON.stringify(obj));
     await fs.rename(tmp, file);
   };
-  const jobFile = (id) => path.join(pendingDir, `${id}.json`);
+  const jobFile = (id) => path.join(pendingDir, `${safeName(id)}.json`);
 
   return {
     async add(job) { await writeAtomic(jobFile(job.id), job); },
@@ -35,7 +53,7 @@ export async function fileStore(dir) {
       return jobs.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
     },
     async kill(job) {
-      await writeAtomic(path.join(deadDir, `${job.id}.json`), { ...job, diedAt: Date.now() });
+      await writeAtomic(path.join(deadDir, `${safeName(job.id)}.json`), { ...job, diedAt: Date.now() });
       await fs.rm(jobFile(job.id), { force: true });
     },
     async listDead() {
