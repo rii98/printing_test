@@ -1,5 +1,7 @@
 node_modules/
 .queue/
 printers.json
+ecosystem.config.cjs
+logs/
 *.log
 .DS_Store
