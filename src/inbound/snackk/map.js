@@ -181,6 +181,57 @@ export function printActionVoidSeed(dto, config, printed) {
 }
 
 /**
+ * A partial LINE-VOID pull chit → a VOID slip naming exactly the lines pulled.
+ *
+ * Distinct from a whole-ticket void: the order stays LIVE (only the line was
+ * pulled), so this never rides `order.state='void'` on the ticket feed — it
+ * arrives on its own `line.void` event (snackk server/realtime/voidChit.ts). Its
+ * idempotency identity is the LINE(s), not the order: `orderId:lineIds@0:void`,
+ * so it can't collide with the order-level `orderId@0:void` of a later
+ * whole-ticket void, nor with a second pull on the same ticket. It reuses the
+ * void layout (which already lists items), so a cook holding the KOT strikes the
+ * named dish and nothing else.
+ * @param {import('./types').LineVoidChitDto} dto
+ * @returns {import('../../core/domain.js').Ticket}
+ */
+export function lineVoidChitToTicket(dto) {
+  const lines = Array.isArray(dto.lines) ? dto.lines : [];
+  const ticket = {
+    id: `${dto.orderId}:${lines.map((l) => l.id).join(',')}`,
+    revision: 0,
+    number: dto.ticketNumber,
+    station: dto.station,
+    table: dto.tableLabel,
+    placedAt: dto.placedAt,
+    // Each item flagged voided — the pull is the whole point of the slip.
+    items: mapItems(lines).map((it) => ({ ...it, voided: true })),
+    voided: true,
+  };
+  if (dto.reason) ticket.voidReason = dto.reason;
+  return ticket;
+}
+
+/**
+ * Decide what to do with one `line.void` pull chit — used for BOTH the live event
+ * and the recovery seed, because the gate is identical either way (unlike the
+ * whole-ticket void, whose live vs seed split is only an artefact of `printAction`
+ * being a shared switch). Print a pull slip ONLY if this agent printed the
+ * ticket's KOT/BOT — otherwise no slip ever came out and the pull is noise. The
+ * printed-KOT question is keyed on the ORDER id (that's what the ledger records at
+ * fire), never the line. The distinct `id@0:void` key makes a re-seed a no-op.
+ * @param {{orderId:string}} dto
+ * @param {{stationDelivery:'kds'|'print'|'both'}} config
+ * @param {{has:(k:string)=>boolean}} printed  orderIds known printed (durable-backed)
+ * @returns {{action:'print'|'skip', reason:string, ticket?:import('../../core/domain.js').Ticket}}
+ */
+export function printActionLineVoid(dto, config, printed) {
+  const printing = config.stationDelivery === 'print' || config.stationDelivery === 'both';
+  if (!printing) return { action: 'skip', reason: 'kds-only' };
+  if (!printed.has(dto.orderId)) return { action: 'skip', reason: 'linevoid-never-printed' };
+  return { action: 'print', reason: 'line-void', ticket: lineVoidChitToTicket(dto) };
+}
+
+/**
  * Read a snackk NPR display string (server/domain/pricing.ts formatNPR, e.g.
  * `रू 1,234.56` or `-रू 50.00`) as a Number in major units. We parse rather than
  * print the string because the symbol is Devanagari and grouping is South-Asian —

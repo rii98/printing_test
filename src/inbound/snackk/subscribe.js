@@ -27,7 +27,7 @@
 
 import { createSseParser } from './sse-parse.js';
 import { createConfigClient } from './config.js';
-import { printAction, printActionSeed, printActionVoidSeed, billToTicket } from './map.js';
+import { printAction, printActionSeed, printActionVoidSeed, printActionLineVoid, billToTicket } from './map.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -176,6 +176,16 @@ export function subscribeStation({
     await applyDecision(dto, printAction(dto, cfg, printed));
   }
 
+  // A partial line void: pull one dish off a KOT that already printed. It rides
+  // its own event because the order stays live (see map.printActionLineVoid); the
+  // slip prints only if this agent printed that ticket's KOT (the guard is inside
+  // the decision), and firstPrint is unset so it never touches the printed ledger.
+  async function handleLineVoid(dto) {
+    const cfg = getConfig();
+    if (!cfg) return;
+    await applyDecision(dto, printActionLineVoid(dto, cfg, printed));
+  }
+
   // Seed the current board: the live stream only fires on the fire-state EVENT,
   // and the hub's replay buffer is bounded and dropped when the channel's last
   // subscriber leaves — so a KOT that fired while this agent was disconnected (or
@@ -244,6 +254,39 @@ export function subscribeStation({
     }
   }
 
+  // Recover PULL CHITS. A partial line void fires one `line.void` event and is
+  // gone; the order stays live, so — unlike a KOT — it never sits on a board the
+  // active seed re-reads, and — unlike a whole-ticket void — it never flips the
+  // order to `void` for seedVoids to find. So it has its own recovery window
+  // (server /line-voids/recent): chits for lines voided in the lookback whose
+  // order is still live. Same guard as the live path (a slip only for a printed
+  // KOT), and the distinct per-line `id@0:void` key dedupes a re-seed — so this
+  // runs on every (re)connect + reconcile like the others. Best-effort.
+  async function seedLineVoids() {
+    const cfg = getConfig();
+    if (!cfg) return;
+    let chits;
+    try {
+      const since = Date.now() - recoverLookbackMs;
+      const res = await fetchImpl(`${baseUrl}/api/print/station/${station}/line-voids/recent?since=${since}`, {
+        headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`line-voids → HTTP ${res.status}`);
+      ({ chits } = await res.json());
+    } catch (err) {
+      log.warn?.(`[snackk] ${station} line-void recovery failed: ${err.message}`);
+      return;
+    }
+    for (const dto of Array.isArray(chits) ? chits : []) {
+      try {
+        await applyDecision(dto, printActionLineVoid(dto, cfg, printed));
+      } catch (err) {
+        log.warn?.(`[snackk] ${station} bad line-void chit: ${err.message}`);
+      }
+    }
+  }
+
   async function connectOnce() {
     const headers = { Authorization: `Bearer ${deviceKey}`, Accept: 'text/event-stream' };
     if (lastEventId) headers['Last-Event-ID'] = lastEventId;
@@ -263,6 +306,7 @@ export function subscribeStation({
     // this run's seed, so the order is a clarity choice, not a correctness one.
     await seedActive();
     await seedVoids();
+    await seedLineVoids();
     try {
       await pump({
         res, ac, idleTimeoutMs, isStopped: () => stopped,
@@ -275,6 +319,13 @@ export function subscribeStation({
               await handle(JSON.parse(e.data));
             } catch (err) {
               log.warn?.(`[snackk] bad frame on ${station}: ${err.message}`);
+            }
+          } else if (e.event === 'line.void') {
+            status.lastEventAt = Date.now();
+            try {
+              await handleLineVoid(JSON.parse(e.data));
+            } catch (err) {
+              log.warn?.(`[snackk] bad line-void frame on ${station}: ${err.message}`);
             }
           }
         },
@@ -306,6 +357,7 @@ export function subscribeStation({
   reconcileTimer = setInterval(() => {
     seedActive().catch((err) => log.warn?.(`[snackk] ${station} reconcile: ${err?.message}`));
     seedVoids().catch((err) => log.warn?.(`[snackk] ${station} void reconcile: ${err?.message}`));
+    seedLineVoids().catch((err) => log.warn?.(`[snackk] ${station} line-void reconcile: ${err?.message}`));
   }, reconcileMs);
   reconcileTimer.unref?.(); // never keep the process alive just to reconcile
 

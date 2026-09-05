@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { printAction, printActionSeed } from '../src/inbound/snackk/map.js';
+import { printAction, printActionSeed, printActionLineVoid, lineVoidChitToTicket } from '../src/inbound/snackk/map.js';
+import { ticketKey } from '../src/core/domain.js';
 
 const dto = (over = {}) => ({
   orderId: 'o1', station: 'kitchen', state: 'received', ticketNumber: 1,
@@ -62,4 +63,51 @@ test('seed prints any board ticket (even a bumped one), gated on delivery mode',
   const kds = printActionSeed(dto(), { ...CFG, stationDelivery: 'kds' }, new Set());
   assert.equal(kds.action, 'skip');
   assert.equal(kds.reason, 'kds-only');
+});
+
+// ---- line-void pull chits (a partial void; the order stays live) ----
+
+const chit = (over = {}) => ({
+  orderId: 'o1', ticketNumber: 7, station: 'kitchen', tableLabel: 'T3',
+  placedAt: '2026-08-08T10:00:00Z', reason: 'Wrong item',
+  lines: [{ id: 'L9', itemName: 'Momo', variantName: 'Full', quantity: 2, modifiers: [], note: null }],
+  ...over,
+});
+
+test('a pull chit prints a VOID slip only if the KOT was already printed', () => {
+  const unprinted = printActionLineVoid(chit(), CFG, new Set());
+  assert.equal(unprinted.action, 'skip');
+  assert.equal(unprinted.reason, 'linevoid-never-printed');
+
+  const d = printActionLineVoid(chit(), CFG, new Set(['o1']));
+  assert.equal(d.action, 'print');
+  assert.equal(d.reason, 'line-void');
+  assert.equal(d.ticket.voided, true);
+  assert.equal(d.ticket.items[0].name, 'Momo (Full)');
+  assert.equal(d.ticket.items[0].voided, true);
+  assert.equal(d.ticket.voidReason, 'Wrong item');
+});
+
+test('a pull chit never prints under KDS-only delivery', () => {
+  const d = printActionLineVoid(chit(), { ...CFG, stationDelivery: 'kds' }, new Set(['o1']));
+  assert.equal(d.action, 'skip');
+  assert.equal(d.reason, 'kds-only');
+});
+
+test('a pull chit prints even with no reason (a frictionless guest self-cancel)', () => {
+  const d = printActionLineVoid(chit({ reason: null }), CFG, new Set(['o1']));
+  assert.equal(d.action, 'print');
+  assert.equal(d.ticket.voidReason, undefined);
+});
+
+test('a pull chit idempotency key is per-LINE, distinct from the whole-ticket void', () => {
+  // The line chit and a later whole-ticket void of the same order must not
+  // collapse onto one key, or the second slip would be dropped as a duplicate.
+  const lineKey = ticketKey(lineVoidChitToTicket(chit()));
+  assert.equal(lineKey, 'o1:L9@0:void');
+
+  const otherLine = ticketKey(lineVoidChitToTicket(chit({ lines: [{ id: 'L10', itemName: 'Dal', variantName: null, quantity: 1, modifiers: [], note: null }] })));
+  assert.equal(otherLine, 'o1:L10@0:void');
+  assert.notEqual(lineKey, otherLine);            // two pulls on one ticket stay distinct
+  assert.notEqual(lineKey, 'o1@0:void');          // never the order-level void key
 });

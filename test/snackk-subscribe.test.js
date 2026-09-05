@@ -106,6 +106,7 @@ test('seeds the active board on connect, printing a KOT missed while disconnecte
   let streamCalls = 0;
   const fetchImpl = async (url) => {
     if (url.endsWith('/active')) return { ok: true, json: async () => ({ mode: 'direct', tickets: [seedTicket] }) };
+    if (url.includes('/line-voids/recent')) return { ok: true, json: async () => ({ chits: [] }) };
     if (url.includes('/voids/recent')) return { ok: true, json: async () => ({ tickets: [] }) };
     // The station stream: open once (empty), then refuse reconnects.
     return ++streamCalls === 1 ? sseResponse(['retry: 3000\n\n']) : { ok: false, status: 499, body: null };
@@ -184,6 +185,7 @@ test('idle watchdog reconnects when a connected stream goes silent (no heartbeat
   let streamConnects = 0;
   const fetchImpl = (url, opts) => {
     if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    if (url.includes('/line-voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ chits: [] }) });
     if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
     streamConnects += 1;
     return Promise.resolve(hangingSse([': ping\n\n'], opts)); // one ping, then silence
@@ -235,6 +237,7 @@ test('periodic reconcile prints a KOT that appears while the stream stays connec
   let streamConnects = 0;
   const fetchImpl = (url, opts) => {
     if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: boardHasTicket ? [ticket] : [] }) });
+    if (url.includes('/line-voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ chits: [] }) });
     if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
     streamConnects += 1;
     return Promise.resolve(hangingSse([': ping\n\n'], opts)); // connected, then quiet (no reconnect within the window)
@@ -263,6 +266,7 @@ test('periodic reconcile prints a KOT that appears while the stream stays connec
 test('status() reports the live link — connected + last event id + seed count', async () => {
   const fetchImpl = (url, opts) => {
     if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    if (url.includes('/line-voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ chits: [] }) });
     if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
     return Promise.resolve(hangingSse([`id: 42\nevent: ticket.new\ndata: ${kotDto()}\n\n`], opts));
   };
@@ -310,6 +314,7 @@ test('subscribeStation recovers a VOID slip from the snapshot when the KOT was p
   };
   const fetchImpl = (url, opts) => {
     if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    if (url.includes('/line-voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ chits: [] }) });
     if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [voided] }) });
     return Promise.resolve(hangingSse([': ping\n\n'], opts));
   };
@@ -336,6 +341,7 @@ test('subscribeStation does NOT recover a void whose KOT it never printed', asyn
   };
   const fetchImpl = (url, opts) => {
     if (url.endsWith('/active')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [] }) });
+    if (url.includes('/line-voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ chits: [] }) });
     if (url.includes('/voids/recent')) return Promise.resolve({ ok: true, json: async () => ({ tickets: [voided] }) });
     return Promise.resolve(hangingSse([': ping\n\n'], opts));
   };
@@ -397,4 +403,73 @@ test('subscribeBills recovery honors a screens-only flip (no receipt)', async ()
   sub.stop();
   assert.equal(billsFetched, false, 'no recovery fetch at all when screens-only');
   assert.equal(printed.length, 0);
+});
+
+const lineVoidDto = (over = {}) => JSON.stringify({
+  orderId: 'o1', ticketNumber: 1, station: 'kitchen', tableLabel: 'T1',
+  placedAt: '2026-08-08T10:00:00Z', reason: 'Wrong item',
+  lines: [{ id: 'L1', itemName: 'Momo', variantName: null, quantity: 1, modifiers: [], note: null }],
+  ...over,
+});
+
+test('a live line.void event prints a pull chit after its KOT fired', async () => {
+  // The KOT fires first (recording o1 in `printed`), then a line is pulled — the
+  // chit must print because the guard sees the KOT already came out.
+  const frames = [
+    'retry: 3000\n\n',
+    `id: 5\nevent: ticket.new\ndata: ${kotDto()}\n\n`,
+    `id: 6\nevent: line.void\ndata: ${lineVoidDto()}\n\n`,
+  ];
+  let calls = 0;
+  const fetchImpl = async (url, opts) => {
+    if (url.endsWith('/active')) return { ok: true, json: async () => ({ tickets: [] }) };
+    if (url.includes('/line-voids/recent')) return { ok: true, json: async () => ({ chits: [] }) };
+    if (url.includes('/voids/recent')) return { ok: true, json: async () => ({ tickets: [] }) };
+    calls += 1;
+    return calls === 1 ? hangingSse(frames, opts) : { ok: false, status: 499, body: null };
+  };
+
+  const printed = [];
+  let resolveGot;
+  const got = new Promise((r) => { resolveGot = r; });
+  const service = {
+    print: async (t) => { printed.push(t); if (printed.length === 2) resolveGot(); return { status: 'queued' }; },
+  };
+  const sub = subscribeStation({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', station: 'kitchen',
+    service, getConfig: () => ({ stationDelivery: 'print', orderRoutingMode: 'direct' }),
+    printed: new Set(), log: NOLOG, fetchImpl, maxBackoffMs: 5,
+    idleTimeoutMs: 1000, connectTimeoutMs: 1000, reconcileMs: 1_000_000,
+  });
+  await got;
+  sub.stop();
+
+  assert.equal(printed[0].voided ?? false, false, 'first slip is the KOT');
+  assert.equal(printed[1].voided, true, 'second slip is the pull chit');
+  assert.equal(printed[1].id, 'o1:L1');
+  assert.equal(printed[1].items[0].name, 'Momo');
+});
+
+test('a pull chit missed while offline is recovered from the line-voids seed', async () => {
+  // No live events — the chit only exists in the recovery window. With the KOT
+  // already known printed (durable-backed `printed`), the seed must print it.
+  let resolveGot;
+  const got = new Promise((r) => { resolveGot = r; });
+  const service = { print: async (t) => { resolveGot(t); return { status: 'queued' }; } };
+  const fetchImpl = async (url, opts) => {
+    if (url.endsWith('/active')) return { ok: true, json: async () => ({ tickets: [] }) };
+    if (url.includes('/line-voids/recent')) return { ok: true, json: async () => ({ chits: [JSON.parse(lineVoidDto())] }) };
+    if (url.includes('/voids/recent')) return { ok: true, json: async () => ({ tickets: [] }) };
+    return hangingSse(['retry: 3000\n\n', ': ping\n\n'], opts); // connected, quiet
+  };
+  const sub = subscribeStation({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', station: 'kitchen',
+    service, getConfig: () => ({ stationDelivery: 'print', orderRoutingMode: 'direct' }),
+    printed: new Set(['o1']), log: NOLOG, fetchImpl, maxBackoffMs: 5,
+    idleTimeoutMs: 1000, connectTimeoutMs: 1000, reconcileMs: 1_000_000,
+  });
+  const t = await got;
+  sub.stop();
+  assert.equal(t.voided, true);
+  assert.equal(t.id, 'o1:L1');
 });
