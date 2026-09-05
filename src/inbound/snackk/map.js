@@ -186,18 +186,22 @@ export function printActionVoidSeed(dto, config, printed) {
  * Distinct from a whole-ticket void: the order stays LIVE (only the line was
  * pulled), so this never rides `order.state='void'` on the ticket feed — it
  * arrives on its own `line.void` event (snackk server/realtime/voidChit.ts). Its
- * idempotency identity is the LINE(s), not the order: `orderId:lineIds@0:void`,
- * so it can't collide with the order-level `orderId@0:void` of a later
- * whole-ticket void, nor with a second pull on the same ticket. It reuses the
- * void layout (which already lists items), so a cook holding the KOT strikes the
- * named dish and nothing else.
+ * idempotency identity is the BATCH, not the order: `orderId:batchId@0:void`, so
+ * it can't collide with the order-level `orderId@0:void` of a later whole-ticket
+ * void, nor with a second pull on the same ticket — and a multi-select pull
+ * prints ONE slip whose key is stable regardless of line count or order. It
+ * reuses the void layout (which already lists items), so a cook holding the KOT
+ * strikes the named dishes and nothing else.
  * @param {import('./types').LineVoidChitDto} dto
  * @returns {import('../../core/domain.js').Ticket}
  */
 export function lineVoidChitToTicket(dto) {
   const lines = Array.isArray(dto.lines) ? dto.lines : [];
+  // Key on the batch; fall back to the line ids only for a chit somehow missing
+  // one (older server), so the slip still prints with a stable identity.
+  const batch = dto.batchId || lines.map((l) => l.id).join(',');
   const ticket = {
-    id: `${dto.orderId}:${lines.map((l) => l.id).join(',')}`,
+    id: `${dto.orderId}:${batch}`,
     revision: 0,
     number: dto.ticketNumber,
     station: dto.station,

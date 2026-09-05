@@ -69,7 +69,7 @@ test('seed prints any board ticket (even a bumped one), gated on delivery mode',
 
 const chit = (over = {}) => ({
   orderId: 'o1', ticketNumber: 7, station: 'kitchen', tableLabel: 'T3',
-  placedAt: '2026-08-08T10:00:00Z', reason: 'Wrong item',
+  placedAt: '2026-08-08T10:00:00Z', reason: 'Wrong item', batchId: 'B1',
   lines: [{ id: 'L9', itemName: 'Momo', variantName: 'Full', quantity: 2, modifiers: [], note: null }],
   ...over,
 });
@@ -100,14 +100,37 @@ test('a pull chit prints even with no reason (a frictionless guest self-cancel)'
   assert.equal(d.ticket.voidReason, undefined);
 });
 
-test('a pull chit idempotency key is per-LINE, distinct from the whole-ticket void', () => {
-  // The line chit and a later whole-ticket void of the same order must not
-  // collapse onto one key, or the second slip would be dropped as a duplicate.
-  const lineKey = ticketKey(lineVoidChitToTicket(chit()));
-  assert.equal(lineKey, 'o1:L9@0:void');
+test('a pull chit idempotency key is per-BATCH, distinct from the whole-ticket void', () => {
+  // The chit and a later whole-ticket void of the same order must not collapse
+  // onto one key, or the second slip would be dropped as a duplicate.
+  const key = ticketKey(lineVoidChitToTicket(chit({ batchId: 'B1' })));
+  assert.equal(key, 'o1:B1@0:void');
 
-  const otherLine = ticketKey(lineVoidChitToTicket(chit({ lines: [{ id: 'L10', itemName: 'Dal', variantName: null, quantity: 1, modifiers: [], note: null }] })));
-  assert.equal(otherLine, 'o1:L10@0:void');
-  assert.notEqual(lineKey, otherLine);            // two pulls on one ticket stay distinct
-  assert.notEqual(lineKey, 'o1@0:void');          // never the order-level void key
+  // A different batch — a second pull on the same ticket — stays distinct.
+  const other = ticketKey(lineVoidChitToTicket(chit({ batchId: 'B2' })));
+  assert.equal(other, 'o1:B2@0:void');
+  assert.notEqual(key, other);
+
+  // The SAME batch re-sent (a recovery replay) keys the same, so it dedupes —
+  // the identity is the batch, not the (order-dependent) line list.
+  const resend = ticketKey(lineVoidChitToTicket(chit({
+    batchId: 'B1', lines: [{ id: 'Lx', itemName: 'x', variantName: null, quantity: 1, modifiers: [], note: null }],
+  })));
+  assert.equal(resend, key);
+  assert.notEqual(key, 'o1@0:void'); // never the order-level void key
+});
+
+test('a multi-line pull chit renders every pulled dish on one slip', () => {
+  const d = printActionLineVoid(chit({
+    batchId: 'B9',
+    lines: [
+      { id: 'L1', itemName: 'aa', variantName: null, quantity: 5, modifiers: [], note: null },
+      { id: 'L2', itemName: 'Momo', variantName: null, quantity: 3, modifiers: [], note: null },
+    ],
+  }), CFG, new Set(['o1']));
+  assert.equal(d.action, 'print');
+  assert.equal(d.ticket.id, 'o1:B9');          // one slip, keyed on the batch
+  assert.equal(d.ticket.items.length, 2);
+  assert.deepEqual(d.ticket.items.map((i) => `${i.qty}x ${i.name}`), ['5x aa', '3x Momo']);
+  assert.ok(d.ticket.items.every((i) => i.voided));
 });

@@ -407,7 +407,7 @@ test('subscribeBills recovery honors a screens-only flip (no receipt)', async ()
 
 const lineVoidDto = (over = {}) => JSON.stringify({
   orderId: 'o1', ticketNumber: 1, station: 'kitchen', tableLabel: 'T1',
-  placedAt: '2026-08-08T10:00:00Z', reason: 'Wrong item',
+  placedAt: '2026-08-08T10:00:00Z', reason: 'Wrong item', batchId: 'B1',
   lines: [{ id: 'L1', itemName: 'Momo', variantName: null, quantity: 1, modifiers: [], note: null }],
   ...over,
 });
@@ -446,7 +446,7 @@ test('a live line.void event prints a pull chit after its KOT fired', async () =
 
   assert.equal(printed[0].voided ?? false, false, 'first slip is the KOT');
   assert.equal(printed[1].voided, true, 'second slip is the pull chit');
-  assert.equal(printed[1].id, 'o1:L1');
+  assert.equal(printed[1].id, 'o1:B1'); // keyed on the batch
   assert.equal(printed[1].items[0].name, 'Momo');
 });
 
@@ -471,5 +471,5 @@ test('a pull chit missed while offline is recovered from the line-voids seed', a
   const t = await got;
   sub.stop();
   assert.equal(t.voided, true);
-  assert.equal(t.id, 'o1:L1');
+  assert.equal(t.id, 'o1:B1');
 });
