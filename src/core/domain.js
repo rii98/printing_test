@@ -46,6 +46,8 @@
  *                                      can't be handed the wrong one (falls back to config branding).
  * @property {string[]} [shopLines]     Sub-header lines under the name (e.g. "PAN 123456789").
  * @property {Fiscal} [fiscal]          Legal-document facts for a tax-invoice receipt (see below).
+ * @property {number} [copyOf]          A reprint's copy number (>0). Prints a "COPY OF ORIGINAL"
+ *                                      banner; distinct from the original settle print (copy 0).
  * @property {string} [footer]
  *
  * @typedef {Object} FiscalPayment
@@ -199,6 +201,11 @@ export function normalizeTicket(raw) {
       ? raw.shopLines.filter((l) => typeof l === 'string' && l.trim()).map((l) => l.trim())
       : undefined,
     fiscal: normalizeFiscal(raw.fiscal),
+    // A reprint's copy number, for the "COPY OF ORIGINAL" banner. Cosmetic and
+    // lenient — a bad value is dropped, never fatal (the idempotency key rides
+    // `revision`, which is validated strictly above). Only a positive integer is
+    // a copy; 0/absent is the original.
+    copyOf: isNonNegInt(raw.copyOf) && raw.copyOf > 0 ? raw.copyOf : undefined,
     footer: typeof raw.footer === 'string' ? raw.footer : undefined,
     qr: typeof raw.qr === 'string' ? raw.qr : undefined,
     openDrawer: raw.openDrawer === true,

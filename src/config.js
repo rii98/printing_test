@@ -43,6 +43,12 @@ function defaults() {
     store: { dir: path.join(ROOT, '.queue') },   // durable; set to null for in-memory
     policy: { maxAttempts: 8, baseDelayMs: 500, maxDelayMs: 30_000 },
     discovery: { enabled: true, subnet: null },
+    // PREVIEW mode (SNACKK_PREVIEW=1): print nothing to hardware — render each slip
+    // to the terminal + a file instead. The rest of the pipeline is REAL (SSE,
+    // routing, idempotency, the durable queue), so it verifies the whole chain
+    // end-to-end with no printer. Uses the in-memory `fake` transport, and forces
+    // discovery off (no LAN scan when there is deliberately no printer to find).
+    preview: false,
     shutdown: { graceMs: 10_000 },   // max time to drain in-flight prints before exiting
 
     // snackk integration (outbound SSE). Off unless a URL + device key are set,
@@ -83,6 +89,10 @@ function applyEnv(cfg) {
   if (process.env.SNACKK_URL) cfg.snackk.url = process.env.SNACKK_URL.replace(/\/+$/, '');
   if (process.env.SNACKK_DEVICE_KEY) cfg.snackk.deviceKey = process.env.SNACKK_DEVICE_KEY;
   if (process.env.SNACKK_STATIONS) cfg.snackk.stations = process.env.SNACKK_STATIONS.split(',').map((s) => s.trim()).filter(Boolean);
+  if (process.env.SNACKK_PREVIEW === '1' || process.env.SNACKK_PREVIEW === 'true') {
+    cfg.preview = true;
+    cfg.discovery.enabled = false; // no printer to discover — never scan the LAN
+  }
   return cfg;
 }
 

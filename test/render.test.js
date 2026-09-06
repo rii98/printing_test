@@ -108,6 +108,22 @@ test('a fiscal bill prints the full tax-invoice layout, matching the browser', (
   assert.doesNotMatch(txt, /NAMASTE MINI MARKET/);
 });
 
+test('a reprint prints a COPY OF ORIGINAL banner; the original prints none', () => {
+  const base = {
+    id: 'bill:s3', station: 'cashier', currency: 'Rs', number: 42, table: 'T7',
+    items: [{ name: 'Momo', qty: 1, amount: 100 }],
+    totals: { subtotal: 100, discount: 0, service: 0, tax: 0, total: 100 },
+  };
+  // Original (copy 0) — no banner.
+  assert.doesNotMatch(toText(renderTicket(normalizeTicket(base))), /COPY OF ORIGINAL/);
+  // First reprint — the banner, unnumbered (it's simply "a copy").
+  const c1 = toText(renderTicket(normalizeTicket({ ...base, copyOf: 1 })));
+  assert.match(c1, /COPY OF ORIGINAL/);
+  assert.doesNotMatch(c1, /COPY OF ORIGINAL - /);
+  // Second copy on — numbered.
+  assert.match(toText(renderTicket(normalizeTicket({ ...base, copyOf: 3 }))), /COPY OF ORIGINAL - 3/);
+});
+
 test('a partial/garbage trusted totals block is rejected whole (never half-prints)', () => {
   assert.throws(
     () => normalizeTicket({ id: 'b', station: 'cashier', items: [{ name: 'x', qty: 1, price: 1 }], totals: { subtotal: 10 } }),

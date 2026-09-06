@@ -6,7 +6,7 @@ export const PRINTERS = {
   // Your POS-8360 / 80-V, now static on the Wi-Fi subnet.
   counter: {
     type: PrinterTypes.EPSON,               // POS-8360 reports "EPSON(ESC/POS)"
-    interface: 'tcp://192.168.18.240:9100',
+    interface: 'tcp://192.168.1.240:9100',
     width: 48,                              // 80mm, Font A = 48 chars (576 dots/line)
     characterSet: characterSet.PC437_USA,
     removeSpecialCharacters: false,

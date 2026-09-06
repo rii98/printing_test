@@ -54,6 +54,18 @@ function lineName(line) {
   return line.variantName ? `${line.itemName} (${line.variantName})` : line.itemName;
 }
 
+/**
+ * The table's display name — the zone qualifies the label when there is one.
+ * snackk enforces one label per zone, so "Koshi" can exist in two zones; showing
+ * "Koshi · Garden" vs "Koshi · Patio" keeps the two slips apart on the pass. The
+ * neutral Ticket.table is a display string, so composing here means every layout
+ * (KOT/BOT, VOID, pull chit) reads the same identity with no layout change.
+ */
+function tableDisplay(label, zone) {
+  const z = typeof zone === 'string' && zone.trim() ? zone.trim() : null;
+  return z ? `${label} · ${z}` : label;
+}
+
 /** OrderTicketDto lines → neutral TicketItems. Modifiers become plain names
  *  (a KOT/BOT shows WHAT to make, never the price of a modifier). */
 function mapItems(lines) {
@@ -88,7 +100,7 @@ export function orderTicketToTicket(dto) {
     revision: 0,
     number: dto.ticketNumber,
     station: dto.station,
-    table: dto.tableLabel,
+    table: tableDisplay(dto.tableLabel, dto.tableZone),
     placedAt: dto.placedAt,
     items: mapItems(dto.lines),
     voided,
@@ -205,7 +217,7 @@ export function lineVoidChitToTicket(dto) {
     revision: 0,
     number: dto.ticketNumber,
     station: dto.station,
-    table: dto.tableLabel,
+    table: tableDisplay(dto.tableLabel, dto.tableZone),
     placedAt: dto.placedAt,
     // Each item flagged voided — the pull is the whole point of the slip.
     items: mapItems(lines).map((it) => ({ ...it, voided: true })),
@@ -261,20 +273,33 @@ export function parseNpr(s) {
  * counter's. Rendered via the bill layout's TRUSTED-breakdown path (`totals`),
  * with per-line amounts trusted too (they include modifier deltas).
  *
- * id `bill:<sessionId>` @revision 0 → the durable idempotency store prints one
- * receipt per settled tab even if the event is replayed after a reconnect.
+ * id `bill:<sessionId>` @revision <copy> → the durable idempotency store prints
+ * one receipt per (settled tab, copy) even if the event is replayed after a
+ * reconnect. The ORIGINAL settle print carries copy 0 (`bill:<id>@0`); a POS
+ * reprint carries its monotonic copy number, so `bill:<id>@1`, `@2`, … are each
+ * a distinct key that prints once — where a bare re-emit at copy 0 would be
+ * dropped as a duplicate of the original. Absent/invalid copy ⇒ 0 (an older
+ * server that never sends `copy` still prints its one receipt).
  * @param {import('./types').BillDto} bill
  * @param {{currency?:string}} [opts]
  * @returns {import('../../core/domain.js').Ticket}
  */
 export function billToTicket(bill, { currency = 'Rs' } = {}) {
   const vatRate = Number(bill.vatRate);
+  const copy = Number.isInteger(bill.copy) && bill.copy > 0 ? bill.copy : 0;
   return {
     id: `bill:${bill.sessionId}`,
-    revision: 0,
+    revision: copy,
+    // A reprint is a COPY by definition (the guest already has the settle
+    // receipt), so any copy > 0 is banner-worthy — independent of the browser's
+    // own "Copy of Original – N" threshold.
+    copyOf: copy > 0 ? copy : undefined,
     number: bill.billNumber ?? undefined,
     station: 'cashier',
-    table: bill.tableLabel,
+    // Same table identity every other slip shows (see tableDisplay): a label is
+    // unique only WITHIN a zone, so the receipt names the zone too when there is
+    // one — "Koshi · Garden". For a merged tab this is the primary's zone.
+    table: tableDisplay(bill.tableLabel, bill.zone),
     placedAt: bill.closedAt ?? bill.openedAt,
     currency,
     // The issuer identity rides WITH the bill — the receipt prints who the bill

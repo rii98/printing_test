@@ -21,13 +21,18 @@ export class PrintService {
    * @param {{shopName?:string, shopLines?:string[]}} [o.branding]
    * @param {import('./idempotency.js').Idempotency} [o.idempotency]
    * @param {(evt:any)=>void} [o.onEvent]
+   * @param {((o:{doc:any, ticket:any, width:number})=>void)|null} [o.preview]
+   *   PREVIEW mode: called with the rendered doc for every slip that clears
+   *   idempotency, so a "printer" can show the slip (terminal/file) instead of —
+   *   or alongside — sending bytes. Best-effort; a throw here never fails the print.
    */
-  constructor({ printers, stationToPrinter, branding = {}, idempotency = memoryIdempotency(), onEvent = () => {} }) {
+  constructor({ printers, stationToPrinter, branding = {}, idempotency = memoryIdempotency(), onEvent = () => {}, preview = null }) {
     this.printers = printers;
     this.stationToPrinter = stationToPrinter;
     this.branding = branding;
     this.idem = idempotency;
     this.onEvent = onEvent;
+    this.preview = preview;
   }
 
   /**
@@ -72,6 +77,12 @@ export class PrintService {
     try {
       const docKind = printer.docKind ?? STATION_DOC[ticket.station];
       const doc = renderTicket(ticket, { docKind, branding: this.branding });
+      // PREVIEW: surface the exact slip (from the SAME doc the encoder consumes)
+      // before it becomes opaque bytes. Best-effort — never fails the print.
+      if (this.preview) {
+        try { this.preview({ doc, ticket, width: printer.width }); }
+        catch (err) { this.onEvent({ type: 'preview-error', error: String(err.message || err) }); }
+      }
       const bytes = encode(doc, { width: printer.width, encoding: printer.encoding ?? 'latin1', cut: printer.cut !== false, cutFeed: printer.cutFeed });
       await printer.queue.enqueue({ id: key, key, bytes, label: `${ticket.station}#${ticket.number ?? ''}` });
     } catch (err) {

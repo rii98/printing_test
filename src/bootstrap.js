@@ -8,6 +8,8 @@
 import { PrinterQueue } from './core/queue.js';
 import { PrintService } from './core/service.js';
 import { tcpTransport } from './adapters/transport/tcp.js';
+import { fakeTransport } from './adapters/transport/fake.js';
+import { previewSink } from './adapters/preview-sink.js';
 import { fileStore } from './adapters/store/file.js';
 import { memoryStore } from './adapters/store/memory.js';
 import { fileIdempotency } from './adapters/store/idempotency-file.js';
@@ -55,13 +57,17 @@ export async function buildService(cfg, { onEvent = logEvent } = {}) {
   const printers = new Map();
   for (const [id, p] of Object.entries(cfg.printers)) {
     const stations = printerStations(p);
+    // Preview: a printer with no stations can never be routed to — skip the noise.
+    if (cfg.preview && stations.length === 0) continue;
     const host = (p.mac && macToIp.get(normalizeMac(p.mac))) || p.host || null;
-    if (!host) { log.error(`printer "${id}" has no address (mac not found, no host) — station(s) "${stations.join(', ')}" will not print`, {}); continue; }
-    const transport = tcpTransport({ host, port: p.port ?? 9100 });
+    // Preview mode needs no address — the fake transport swallows the bytes and the
+    // preview sink shows the slip instead. Only the real path requires a host.
+    if (!host && !cfg.preview) { log.error(`printer "${id}" has no address (mac not found, no host) — station(s) "${stations.join(', ')}" will not print`, {}); continue; }
+    const transport = cfg.preview ? fakeTransport() : tcpTransport({ host, port: p.port ?? 9100 });
     const queue = new PrinterQueue({ printerId: id, transport, store, onEvent, policy: cfg.policy });
     await queue.recover();
     printers.set(id, { queue, width: p.width ?? 48, encoding: p.encoding ?? 'latin1', cut: p.cut !== false, cutFeed: p.cutFeed, docKind: p.docKind });
-    log.info(`printer "${id}" -> ${transport.describe}`, { stations, source: p.mac && macToIp.get(normalizeMac(p.mac)) ? 'discovered' : 'configured' });
+    log.info(`printer "${id}" -> ${transport.describe}${cfg.preview ? ' (PREVIEW — no hardware)' : ''}`, { stations, source: p.mac && macToIp.get(normalizeMac(p.mac)) ? 'discovered' : 'configured' });
   }
 
   // Hydrate idempotency from jobs that outlived the last run: a still-pending or
@@ -77,6 +83,8 @@ export async function buildService(cfg, { onEvent = logEvent } = {}) {
     branding: { shopName: cfg.shop.name, shopLines: cfg.shop.lines },
     idempotency,
     onEvent,
+    preview: cfg.preview ? previewSink({ dir: cfg.store?.dir ?? null }) : null,
   });
+  if (cfg.preview) log.info('PREVIEW mode: slips render to the terminal' + (cfg.store?.dir ? ` + ${cfg.store.dir}/preview-slips.txt` : '') + ' — no printer used');
   return { service, printers, store, idempotency };
 }

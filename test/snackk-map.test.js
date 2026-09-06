@@ -5,6 +5,7 @@ import {
   isPrintFire,
   isVoid,
   orderTicketToTicket,
+  lineVoidChitToTicket,
   printActionVoidSeed,
   parseNpr,
   billToTicket,
@@ -64,6 +65,32 @@ test('maps the core ticket fields through unchanged', () => {
   assert.equal(t.station, 'kitchen');
   assert.equal(t.table, 'T3');
   assert.equal(t.voided, false);
+});
+
+test('a zone qualifies the table name; no zone leaves the bare label', () => {
+  // snackk allows the same label in two zones, so the slip must name the zone to
+  // keep them apart on the pass.
+  assert.equal(orderTicketToTicket(dto({ tableLabel: 'Koshi', tableZone: 'Garden' })).table, 'Koshi · Garden');
+  assert.equal(orderTicketToTicket(dto({ tableLabel: 'Koshi', tableZone: null })).table, 'Koshi');
+  assert.equal(orderTicketToTicket(dto({ tableLabel: 'Koshi' })).table, 'Koshi'); // zone absent
+});
+
+test('the pull-chit slip zone-qualifies the table too', () => {
+  const chit = {
+    orderId: '11111111-1111-1111-1111-111111111111',
+    ticketNumber: 7,
+    station: 'kitchen',
+    tableLabel: 'Koshi',
+    tableZone: 'Patio',
+    placedAt: '2026-08-08T10:00:00.000Z',
+    reason: 'Guest cancelled',
+    batchId: '33333333-3333-3333-3333-333333333333',
+    lines: [{ id: 'l1', itemName: 'Momo', variantName: null, quantity: 2, modifiers: [], note: null }],
+  };
+  const t = lineVoidChitToTicket(chit);
+  assert.equal(t.table, 'Koshi · Patio');
+  assert.equal(t.voided, true);
+  assert.equal(t.items[0].voided, true);
 });
 
 test('inlines the variant into the dish name and flattens modifiers to names', () => {
@@ -155,6 +182,15 @@ test('billToTicket → a valid cashier Ticket, money passed through verbatim', (
   );
 });
 
+test('the receipt zone-qualifies the table, exactly as the KOT/VOID slips do', () => {
+  // The same reasoning as the ticket slips: a label is unique only within a zone,
+  // so two tabs can both read "Koshi" — the receipt names the zone to keep them
+  // apart. No zone → the bare label, unchanged.
+  assert.equal(billToTicket(billDto({ tableLabel: 'Koshi', zone: 'Garden' })).table, 'Koshi · Garden');
+  assert.equal(billToTicket(billDto({ tableLabel: 'Koshi', zone: null })).table, 'Koshi');
+  assert.equal(billToTicket(billDto({ tableLabel: 'Koshi' })).table, 'Koshi'); // zone absent
+});
+
 test('billToTicket carries the fiscal document facts when accounting issued one', () => {
   const t = normalizeTicket(billToTicket(billDto({
     fiscal: {
@@ -190,6 +226,38 @@ test('billToTicket prefers exact paisa over the display string for total/discoun
   const t = billToTicket(billDto({ total: 'रू 999.99', totalPaisa: 30750, discount: 'रू 999.99', discountPaisa: 1549 }));
   assert.equal(t.totals.total, 307.5);
   assert.equal(t.totals.discount, 15.49);
+});
+
+test('the settle print has copy 0 → revision 0, no copy banner', () => {
+  // The original: absent/0 copy keys @0, exactly as before this feature.
+  const original = billToTicket(billDto());
+  assert.equal(original.revision, 0);
+  assert.equal(ticketKey(original), 'bill:99999999-9999-9999-9999-999999999999@0');
+  assert.equal(original.copyOf, undefined);
+  // An older server that never sends `copy` behaves identically.
+  const legacy = billToTicket(billDto({ copy: undefined }));
+  assert.equal(legacy.revision, 0);
+  assert.equal(legacy.copyOf, undefined);
+});
+
+test('a reprint copy becomes the revision → a DISTINCT idempotency key', () => {
+  // The whole point: copy N keys @N, so it prints once instead of being dropped
+  // as a duplicate of the @0 original.
+  const c1 = billToTicket(billDto({ copy: 1 }));
+  assert.equal(c1.revision, 1);
+  assert.equal(ticketKey(c1), 'bill:99999999-9999-9999-9999-999999999999@1');
+  assert.equal(c1.copyOf, 1);
+
+  const c2 = billToTicket(billDto({ copy: 2 }));
+  assert.equal(ticketKey(c2), 'bill:99999999-9999-9999-9999-999999999999@2');
+  assert.equal(c2.copyOf, 2);
+});
+
+test('a non-integer or negative copy is treated as the original (copy 0)', () => {
+  // Defensive: only a positive integer bumps the revision; anything else is @0.
+  assert.equal(billToTicket(billDto({ copy: -1 })).revision, 0);
+  assert.equal(billToTicket(billDto({ copy: 1.5 })).revision, 0);
+  assert.equal(billToTicket(billDto({ copy: '3' })).revision, 0);
 });
 
 // ── printActionVoidSeed: recovering VOID slips from a snapshot ───────────────
