@@ -451,9 +451,16 @@ export function subscribeBills({
     status.connects += 1;
     status.lastByteAt = Date.now();
     log.info?.('[snackk] subscribed bills');
-    // Recover any bill settled while we were disconnected before draining the live
-    // stream; an event landing meanwhile is read right after and deduped.
-    await seedBills();
+    // Recover any bill settled while we were disconnected — but do NOT block the
+    // live stream behind it. seedBills re-reads a 12-HOUR window on every connect,
+    // which in a busy service is hundreds of bills; awaiting it first meant a
+    // freshly-settled bill sitting on the wire had to wait out the whole backlog
+    // before it printed (minutes, under a reconnect storm). Drain live and recover
+    // CONCURRENTLY instead: overlap is safe because service.print() reserves the
+    // idempotency key synchronously, so a bill arriving on both paths is deduped,
+    // never printed twice. The bill feed has no seed-ordering dependency (no void
+    // gate, one event type), so unlike the station feed the two can freely race.
+    const recovering = seedBills().catch((err) => log.warn?.(`[snackk] bill recovery failed: ${err.message}`));
     try {
       await pump({
         res, ac, idleTimeoutMs, isStopped: () => stopped,
@@ -473,6 +480,9 @@ export function subscribeBills({
     } finally {
       activeAc = null;
       status.connected = false;
+      // Let the concurrent recovery settle before we loop to reconnect, so a
+      // reconnect never stacks a second seedBills on top of an in-flight one.
+      await recovering;
     }
   }
 
