@@ -3,7 +3,9 @@
 A field write-up of the investigation, root cause, and fix for the restaurant
 where **bill receipts were slow (minutes) or didn't print at all**, while
 **KOT/BOT slips printed fine**. Kept as a reference in case anything similar
-recurs. Resolved 2026-09-21.
+recurs. First resolved 2026-09-21; a **follow-on regression** (a third bug
+introduced by the Sep-21 agent fix) was found and fixed 2026-09-22 — see
+[Round 2](#round-2-the-await-recovering-wedge-2026-09-22) at the bottom.
 
 > TL;DR — Two bugs, one trigger.
 > - **Trigger:** the print agent's connection to snackk dropped constantly
@@ -188,6 +190,59 @@ threshold effect, not a switch — which is why it felt sudden.
   25s heartbeat (2.4×, tolerates one missed ping). If faster dead-link detection
   is ever needed, shorten the **heartbeat and idle timeout together** (e.g.
   10s/25s), a coordinated change on both sides.
+
+## Round 2: the `await recovering` wedge (2026-09-22)
+
+The day after the Round-1 fix, **billing stuck again on the same laptop** — same
+signature (KOT/BOT fine, bills not), but a **different, self-inflicted cause**: the
+Round-1 agent fix (commit `5d33007`) introduced a new hang.
+
+### What the data showed
+- `/health` was the giveaway: **`bills` feed `connected:false, idleForMs:27113978`
+  (~7.5 hours dead)** while `kitchen`/`bar` were `connected:true`. The feed had
+  stopped reconnecting entirely.
+- Downstream was perfect: `.queue\dead` and `.queue\pending` both empty;
+  `find /c "queued cashier"` == `find /c "printed cashier"` == **796** (every
+  queued bill printed); both printers `healthy`.
+- So bills weren't failing to print — they **never arrived**, because the bills
+  reconnect loop was wedged.
+- Fresh test bills produced **no log line at all** (not queued, not duplicate) —
+  consistent with the live feed dead and recovery not running.
+
+### Root cause
+Round 1's Fix 2 drained the live stream concurrently with recovery — good — but
+"to be tidy" it added `await recovering;` in `subscribeBills.connectOnce`'s
+`finally`. On a half-open wifi socket, `seedBills()`'s `await res.json()` can hang
+**forever** (Node's fetch / undici won't reliably abort a body read on a silently
+dead socket, even with `AbortSignal.timeout`). That hung the `finally`, so
+`connectOnce()` never returned and the reconnect loop was stuck for hours. The
+station feeds have no such await in their finally — which is exactly why only bills
+wedged while KOT/BOT stayed live. Restarting the agent re-established the feed
+(hence "restart helps"), but it re-wedged on the next stall.
+
+### Fix (commit `bd125bd`, agent-only — no snackk change)
+1. **`fetchJson()` helper** — every seed/recovery fetch runs under a **hard
+   deadline that always settles** (one timer aborts the fetch AND rejects the
+   race), so no `await res.json()` can hang. The timer is `unref`'d so it never
+   keeps the process alive on its own.
+2. **Recovery is detached** — `seedBills()` is fired-and-forgotten on the reconnect
+   path (never awaited), guarded by a `seeding` flag so it can't stack. The
+   reconnect loop can no longer be blocked by recovery.
+3. **All station seeds** (active / voids / line-voids) routed through `fetchJson`
+   too, so the same hang can't wedge a station feed either.
+4. **Regression test** — a recovery fetch that hangs forever must not stop the loop
+   reconnecting and printing a live bill (`test/snackk-subscribe.test.js`).
+
+### Verified
+After deploying, `/health` showed `bills connected:true, idleForMs ~4s` with all
+three feeds connected.
+
+### Lesson
+**Never `await` a best-effort recovery on the reconnect/liveness path.** Recovery
+is idempotent and has the 90s reconcile as a backstop; the reconnect loop must
+always be free to proceed. And any `fetch`+`res.json()` over a flaky link needs a
+deadline that is *guaranteed* to fire — `AbortSignal.timeout` alone is not enough
+against a half-open socket.
 
 ## Related docs
 - `docs/SNACKK_INTEGRATION.md` — how the agent wires to snackk over outbound SSE.
