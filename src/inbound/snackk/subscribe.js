@@ -31,6 +31,37 @@ import { printAction, printActionSeed, printActionVoidSeed, printActionLineVoid,
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Fetch + parse JSON with a HARD deadline that ALWAYS settles the returned
+ * promise. On a silently half-open link neither the AbortSignal nor `res.json()`
+ * is guaranteed to unblock — undici can't always tear down a body read on a dead
+ * socket — so a bare `await res.json()` can hang FOREVER and wedge whatever awaits
+ * it. (That is exactly how the bills feed died for hours: one stalled recovery
+ * blocked the reconnect loop's finally.) Here a single timer both aborts the fetch
+ * AND rejects the race, so the caller always proceeds; a stalled read may leak
+ * until the OS reaps the socket, but nothing hangs. Every seed/recovery fetch goes
+ * through this — never a raw fetch+json on the reconnect path.
+ * @returns {Promise<any>} parsed JSON, or throws (HTTP error / timeout / network)
+ */
+async function fetchJson(fetchImpl, url, deviceKey, ms) {
+  const ac = new AbortController();
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => { ac.abort(new Error('deadline')); reject(new Error('request timed out')); }, ms);
+    timer.unref?.(); // never keep the process alive just for this deadline (it still fires while the agent runs)
+  });
+  try {
+    const res = await Promise.race([
+      fetchImpl(url, { headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' }, signal: ac.signal }),
+      deadline,
+    ]);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await Promise.race([res.json(), deadline]);
+  } finally {
+    clearTimeout(timer); // if we won the race, stop the deadline from rejecting unhandled
+  }
+}
+
 // snackk pings every 25s; 60s (2.4×) tolerates one dropped heartbeat before we
 // judge the link dead. CONNECT is the ceiling for the initial fetch to return
 // headers. RECONCILE re-seeds each station's board on a slow cadence so a missed
@@ -199,12 +230,7 @@ export function subscribeStation({
     if (!cfg) return; // no config yet — the config poll + a live event will cover it
     let tickets;
     try {
-      const res = await fetchImpl(`${baseUrl}/api/print/station/${station}/active`, {
-        headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!res.ok) throw new Error(`active → HTTP ${res.status}`);
-      ({ tickets } = await res.json());
+      ({ tickets } = await fetchJson(fetchImpl, `${baseUrl}/api/print/station/${station}/active`, deviceKey, REQUEST_TIMEOUT_MS));
     } catch (err) {
       // Non-fatal: a live event, the next reconcile, or the next reconnect covers it.
       log.warn?.(`[snackk] ${station} seed failed: ${err.message}`);
@@ -235,12 +261,7 @@ export function subscribeStation({
     let tickets;
     try {
       const since = Date.now() - recoverLookbackMs;
-      const res = await fetchImpl(`${baseUrl}/api/print/station/${station}/voids/recent?since=${since}`, {
-        headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!res.ok) throw new Error(`voids → HTTP ${res.status}`);
-      ({ tickets } = await res.json());
+      ({ tickets } = await fetchJson(fetchImpl, `${baseUrl}/api/print/station/${station}/voids/recent?since=${since}`, deviceKey, REQUEST_TIMEOUT_MS));
     } catch (err) {
       log.warn?.(`[snackk] ${station} void recovery failed: ${err.message}`);
       return;
@@ -268,12 +289,7 @@ export function subscribeStation({
     let chits;
     try {
       const since = Date.now() - recoverLookbackMs;
-      const res = await fetchImpl(`${baseUrl}/api/print/station/${station}/line-voids/recent?since=${since}`, {
-        headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!res.ok) throw new Error(`line-voids → HTTP ${res.status}`);
-      ({ chits } = await res.json());
+      ({ chits } = await fetchJson(fetchImpl, `${baseUrl}/api/print/station/${station}/line-voids/recent?since=${since}`, deviceKey, REQUEST_TIMEOUT_MS));
     } catch (err) {
       log.warn?.(`[snackk] ${station} line-void recovery failed: ${err.message}`);
       return;
@@ -393,6 +409,7 @@ export function subscribeBills({
   let attempt = 0;
   let activeAc = null;
   let reconcileTimer = null;
+  let seeding = false; // one recovery at a time; also lets us fire seedBills detached without stacking
   const status = {
     station: 'bills', connected: false, lastEventId: undefined,
     lastByteAt: 0, lastEventAt: 0, connects: 0, seeds: 0, lastError: null,
@@ -415,28 +432,29 @@ export function subscribeBills({
   // dedupes a bill that already printed. Best-effort: a fetch failure is logged and
   // the next reconnect/reconcile covers it. Runs on (re)connect + reconcile.
   async function seedBills() {
-    if (getConfig()?.stationDelivery === 'kds') return; // screens-only: no receipts
-    let bills;
+    if (seeding) return;                                 // never stack (connect + reconcile both call this)
+    if (getConfig()?.stationDelivery === 'kds') return;  // screens-only: no receipts
+    seeding = true;
     try {
-      const since = Date.now() - recoverLookbackMs;
-      const res = await fetchImpl(`${baseUrl}/api/print/bills/recent?since=${since}`, {
-        headers: { Authorization: `Bearer ${deviceKey}`, Accept: 'application/json' },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!res.ok) throw new Error(`bills → HTTP ${res.status}`);
-      ({ bills } = await res.json());
-    } catch (err) {
-      log.warn?.(`[snackk] bill recovery failed: ${err.message}`);
-      return;
-    }
-    for (const bill of Array.isArray(bills) ? bills : []) {
+      let bills;
       try {
-        await handleBill(bill);
+        const since = Date.now() - recoverLookbackMs;
+        ({ bills } = await fetchJson(fetchImpl, `${baseUrl}/api/print/bills/recent?since=${since}`, deviceKey, REQUEST_TIMEOUT_MS));
       } catch (err) {
-        log.warn?.(`[snackk] bad recovered bill: ${err.message}`);
+        log.warn?.(`[snackk] bill recovery failed: ${err.message}`);
+        return;
       }
+      for (const bill of Array.isArray(bills) ? bills : []) {
+        try {
+          await handleBill(bill);
+        } catch (err) {
+          log.warn?.(`[snackk] bad recovered bill: ${err.message}`);
+        }
+      }
+      status.seeds += 1;
+    } finally {
+      seeding = false;
     }
-    status.seeds += 1;
   }
 
   async function connectOnce() {
@@ -451,16 +469,17 @@ export function subscribeBills({
     status.connects += 1;
     status.lastByteAt = Date.now();
     log.info?.('[snackk] subscribed bills');
-    // Recover any bill settled while we were disconnected — but do NOT block the
-    // live stream behind it. seedBills re-reads a 12-HOUR window on every connect,
-    // which in a busy service is hundreds of bills; awaiting it first meant a
-    // freshly-settled bill sitting on the wire had to wait out the whole backlog
-    // before it printed (minutes, under a reconnect storm). Drain live and recover
-    // CONCURRENTLY instead: overlap is safe because service.print() reserves the
-    // idempotency key synchronously, so a bill arriving on both paths is deduped,
-    // never printed twice. The bill feed has no seed-ordering dependency (no void
-    // gate, one event type), so unlike the station feed the two can freely race.
-    const recovering = seedBills().catch((err) => log.warn?.(`[snackk] bill recovery failed: ${err.message}`));
+    // Recover any bill settled while we were disconnected — CONCURRENTLY with the
+    // live stream, and fully DETACHED. seedBills re-reads a 12h window; awaiting it
+    // (even in the finally, to "settle before reconnect") was a trap: on a flaky
+    // link a recovery fetch can stall, and that await then wedged the whole bills
+    // reconnect loop for HOURS while kitchen/bar stayed live (that was the outage).
+    // The reconnect loop must never be blockable by recovery. seedBills self-guards
+    // against stacking (the `seeding` flag) and can no longer hang (fetchJson has a
+    // hard deadline), and the 90s reconcile is the backstop — so firing it and
+    // forgetting is safe. Overlap is safe too: service.print() reserves the
+    // idempotency key synchronously, so a bill on both paths is deduped, not doubled.
+    seedBills().catch(() => {}); // detached — never awaited on the reconnect path
     try {
       await pump({
         res, ac, idleTimeoutMs, isStopped: () => stopped,
@@ -480,9 +499,6 @@ export function subscribeBills({
     } finally {
       activeAc = null;
       status.connected = false;
-      // Let the concurrent recovery settle before we loop to reconnect, so a
-      // reconnect never stacks a second seedBills on top of an in-flight one.
-      await recovering;
     }
   }
 

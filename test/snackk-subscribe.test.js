@@ -405,6 +405,43 @@ test('subscribeBills recovery honors a screens-only flip (no receipt)', async ()
   assert.equal(printed.length, 0);
 });
 
+test('a stalled bill recovery never wedges the reconnect loop', async () => {
+  // Regression for the production outage: seedBills' recovery fetch HANGS (a
+  // half-open wifi socket). The old code awaited recovery in the reconnect
+  // finally, so a single hang froze the bills feed for hours while kitchen/bar
+  // stayed live. Recovery is now detached, so the loop must reconnect and a live
+  // bill on the next connection must still print despite the recovery never
+  // resolving.
+  const bill = {
+    sessionId: 'sb', tableLabel: 'T9', status: 'closed', billNumber: 7,
+    closedAt: '2026-08-08T10:00:00Z', vatRate: '13.00',
+    lines: [{ itemName: 'Momo', quantity: 1, lineTotal: 'रू 100.00' }],
+    subtotal: 'रू 100.00', discount: 'रू 0.00', serviceCharge: 'रू 10.00', vat: 'रू 13.00', total: 'रू 123.00',
+  };
+  let streamConnects = 0;
+  let resolveGot;
+  const got = new Promise((r) => { resolveGot = r; });
+  const fetchImpl = (url, opts) => {
+    if (url.includes('/bills/recent')) return new Promise(() => {}); // recovery hangs forever
+    streamConnects += 1;
+    if (streamConnects === 1) return Promise.resolve(sseResponse([': ping\n\n'])); // connects, then closes -> reconnect
+    // the reconnect delivers a live bill, then stays open
+    return Promise.resolve(hangingSse([`id: 1\nevent: bill.print\ndata: ${JSON.stringify(bill)}\n\n`], opts));
+  };
+  const printed = [];
+  const service = { print: async (t) => { printed.push(t); resolveGot(); return { status: 'queued' }; } };
+  const sub = subscribeBills({
+    baseUrl: 'http://snackk.test', deviceKey: 'k', service,
+    getConfig: () => ({ stationDelivery: 'print' }),
+    log: NOLOG, fetchImpl, maxBackoffMs: 5, idleTimeoutMs: 5000, reconcileMs: 1_000_000,
+  });
+  await got; // resolves only if the loop reconnected and printed the live bill
+  sub.stop();
+  assert.ok(streamConnects >= 2, 'reconnected despite the hung recovery');
+  assert.equal(printed.length, 1);
+  assert.equal(printed[0].id, 'bill:sb');
+});
+
 const lineVoidDto = (over = {}) => JSON.stringify({
   orderId: 'o1', ticketNumber: 1, station: 'kitchen', tableLabel: 'T1',
   placedAt: '2026-08-08T10:00:00Z', reason: 'Wrong item', batchId: 'B1',
