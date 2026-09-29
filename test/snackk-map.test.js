@@ -12,6 +12,8 @@ import {
 } from '../src/inbound/snackk/map.js';
 import { normalizeTicket, ticketKey } from '../src/core/domain.js';
 import { computeTotals } from '../src/core/render/layouts/bill.js';
+import { renderTicket } from '../src/core/render/index.js';
+import { toText } from '../src/core/render/preview.js';
 
 /** A minimal OrderTicketDto as snackk streams it. */
 const dto = (over = {}) => ({
@@ -285,4 +287,72 @@ test('void-seed skips a non-void ticket and respects kds-only', () => {
   assert.equal(printActionVoidSeed(dto({ state: 'preparing' }), cfg, printedWith('x')).reason, 'not-void');
   const voided = dto({ state: 'void' });
   assert.equal(printActionVoidSeed(voided, { stationDelivery: 'kds' }, printedWith(voided.orderId)).reason, 'kds-only');
+});
+
+// ── How the bill was paid, on the PLAIN slip ─────────────────────────────────
+// snackk now sends `payments` on every settled bill, with or without Accounts.
+// These pin the compatibility matrix: new snackk × this agent, old snackk × this
+// agent, and a fiscal bill whose tender must print once — from the document.
+
+const cashEsewa = [
+  { method: 'cash', label: 'Cash', amount: 'रू 107.50', amountPaisa: 10750 },
+  { method: 'esewa', label: 'eSewa', amount: 'रू 200.00', amountPaisa: 20000 },
+];
+
+test('billToTicket carries the tender split for the plain slip (no Accounts)', () => {
+  const t = normalizeTicket(billToTicket(billDto({ payments: cashEsewa })));
+  assert.equal(t.fiscal, undefined);
+  assert.deepEqual(t.payments, [
+    { label: 'Cash', amount: 107.5 },
+    { label: 'eSewa', amount: 200 },
+  ]);
+  // The tender never touches the print identity — a settle still prints once.
+  assert.equal(ticketKey(t), 'bill:99999999-9999-9999-9999-999999999999@0');
+});
+
+test('an older snackk that sends no payments → the plain slip is unchanged', () => {
+  const t = normalizeTicket(billToTicket(billDto()));
+  assert.equal(t.payments, undefined);
+  const txt = toText(renderTicket(t));
+  assert.doesNotMatch(txt, /Paid/);
+});
+
+test('an empty tender list (a fully-comped bill) prints no Paid line', () => {
+  const t = normalizeTicket(billToTicket(billDto({ payments: [] })));
+  assert.equal(t.payments, undefined);
+  assert.doesNotMatch(toText(renderTicket(t)), /Paid/);
+});
+
+test('the plain slip prints one "Paid - X" row per tender', () => {
+  const txt = toText(renderTicket(normalizeTicket(billToTicket(billDto({ payments: cashEsewa })))));
+  assert.match(txt, /Bill #42/);
+  assert.match(txt, /Paid - Cash\s+Rs 107\.50/);
+  assert.match(txt, /Paid - eSewa\s+Rs 200\.00/);
+  assert.doesNotMatch(txt, /TAX INVOICE/);
+});
+
+test('a fiscal bill prints its tender ONCE — from the document, never doubled', () => {
+  const t = normalizeTicket(billToTicket(billDto({
+    payments: cashEsewa,
+    fiscal: {
+      docType: 'abbreviated_invoice', displayNumber: '2083/84-000042',
+      dateBs: '2083-04-24', dateAd: '2026-08-09', taxablePaisa: 25000,
+      payments: [
+        { label: 'Cash', amountPaisa: 10750 },
+        { label: 'eSewa', amountPaisa: 20000 },
+      ],
+    },
+  })));
+  const txt = toText(renderTicket(t));
+  assert.match(txt, /ABBREVIATED TAX INVOICE/);
+  assert.equal(txt.match(/Paid - Cash/g).length, 1);
+  assert.equal(txt.match(/Paid - eSewa/g).length, 1);
+});
+
+test('a malformed tender row is dropped, never fatal — the receipt still prints', () => {
+  const t = normalizeTicket(billToTicket(billDto({
+    payments: [null, { label: '', amountPaisa: 100 }, { label: 'Cash', amountPaisa: 30750 }, 'junk'],
+  })));
+  assert.deepEqual(t.payments, [{ label: 'Cash', amount: 307.5 }]);
+  assert.match(toText(renderTicket(t)), /Paid - Cash\s+Rs 307\.50/);
 });

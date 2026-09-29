@@ -126,7 +126,13 @@ export function billReceipt(t, opts = {}) {
     if (tax) b.row(t.taxLabel ?? `Tax`, money(tax, cur));
     b.rule('-');
     b.row('TOTAL', money(total, cur), { bold: true, doubleH: true });
-    if (t.payment) b.row('Paid', t.payment);
+    // How it was paid — one row per tender, same "Paid - X" wording as the
+    // fiscal receipt. The legacy single-line `payment` only when no list came.
+    if (t.payments && t.payments.length) {
+      for (const p of t.payments) b.row(`Paid - ${p.label}`, money(p.amount, cur));
+    } else if (t.payment) {
+      b.row('Paid', t.payment);
+    }
   }
 
   if (t.qr) b.feed(1).qr(t.qr);

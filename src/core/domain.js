@@ -41,7 +41,11 @@
  *                                      these verbatim and does NOT recompute from item prices — for bills
  *                                      whose money an upstream owns (snackk: VAT-inclusive/promotions/udharo).
  * @property {string} [currency]        e.g. "Rs", "$". Default from config.
- * @property {string} [payment]         e.g. "Cash", "Card", "eSewa".
+ * @property {string} [payment]         e.g. "Cash", "Card", "eSewa". Legacy single-line tender;
+ *                                      `payments` wins when both are present.
+ * @property {FiscalPayment[]} [payments]  How the bill was paid, one row per tender — printed on the
+ *                                      PLAIN slip. A fiscal receipt prints `fiscal.payments` instead
+ *                                      (read from the tax document), never both.
  * @property {string} [shopName]        The issuer's name, carried WITH the bill so the receipt
  *                                      can't be handed the wrong one (falls back to config branding).
  * @property {string[]} [shopLines]     Sub-header lines under the name (e.g. "PAN 123456789").
@@ -84,6 +88,22 @@ const isNonNegInt = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 
 const cleanStr = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
 
 /**
+ * Tolerant normalizer for a tender list (the plain slip's `payments` and the
+ * fiscal block's). Same stance as the fiscal block: a malformed row is dropped,
+ * never fatal — a bill that can't say how it was paid still prints. Returns
+ * undefined when nothing usable survives, so the layout sees plain absence.
+ * @param {any} raw
+ * @returns {FiscalPayment[]|undefined}
+ */
+function normalizePayments(raw) {
+  if (!Array.isArray(raw)) return undefined;
+  const rows = raw
+    .filter((p) => p && typeof p === 'object' && cleanStr(p.label) && isFiniteNum(p.amount))
+    .map((p) => ({ label: p.label.trim(), amount: Number(p.amount) }));
+  return rows.length ? rows : undefined;
+}
+
+/**
  * Tolerant normalizer for the OPTIONAL fiscal block on a cashier bill. Unlike the
  * core ticket fields, a malformed enrichment must NEVER reject the whole receipt —
  * a bill that can't carry its invoice number should still print as a plain slip.
@@ -94,18 +114,14 @@ const cleanStr = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefine
  */
 function normalizeFiscal(raw) {
   if (!raw || typeof raw !== 'object') return undefined;
-  const payments = Array.isArray(raw.payments)
-    ? raw.payments
-        .filter((p) => p && typeof p === 'object' && cleanStr(p.label) && isFiniteNum(p.amount))
-        .map((p) => ({ label: p.label.trim(), amount: Number(p.amount) }))
-    : undefined;
+  const payments = normalizePayments(raw.payments);
   const fiscal = {
     docTitle: cleanStr(raw.docTitle),
     invoiceNo: cleanStr(raw.invoiceNo),
     dateBs: cleanStr(raw.dateBs),
     dateAd: cleanStr(raw.dateAd),
     taxable: isFiniteNum(raw.taxable) ? Number(raw.taxable) : undefined,
-    payments: payments && payments.length ? payments : undefined,
+    payments,
   };
   // Drop the block entirely if nothing survived — the layout treats absence as
   // "plain receipt", so an empty husk would just print a bare title-less slip.
@@ -196,6 +212,7 @@ export function normalizeTicket(raw) {
     totals,
     currency: typeof raw.currency === 'string' ? raw.currency : undefined,
     payment: typeof raw.payment === 'string' ? raw.payment : undefined,
+    payments: normalizePayments(raw.payments),
     shopName: cleanStr(raw.shopName),
     shopLines: Array.isArray(raw.shopLines)
       ? raw.shopLines.filter((l) => typeof l === 'string' && l.trim()).map((l) => l.trim())

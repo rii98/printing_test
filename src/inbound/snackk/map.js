@@ -321,8 +321,27 @@ export function billToTicket(bill, { currency = 'Rs' } = {}) {
       total: typeof bill.totalPaisa === 'number' ? bill.totalPaisa / 100 : parseNpr(bill.total),
     },
     taxLabel: Number.isFinite(vatRate) && vatRate > 0 ? `VAT (${vatRate}%)` : undefined,
+    // How the bill was paid (snackk billPaymentDto[]), for the PLAIN slip. Sent
+    // for every settled bill, with or without snackk's Accounts; the fiscal
+    // receipt prints its own tender split from `fiscal.payments` instead. An
+    // older snackk that never sends it leaves the slip exactly as before.
+    payments: mapPayments(bill.payments),
     fiscal: mapFiscal(bill.fiscal),
   };
+}
+
+/**
+ * snackk tender rows ({label, amountPaisa}) → our neutral {label, amount} in
+ * major units. Shared by the plain slip and the fiscal block so both print the
+ * same words for the same money. Undefined when absent/not a list.
+ * @param {any} list
+ */
+export function mapPayments(list) {
+  if (!Array.isArray(list)) return undefined;
+  return list.map((p) => ({
+    label: cleanStr(p?.label) ?? '',
+    amount: typeof p?.amountPaisa === 'number' ? p.amountPaisa / 100 : 0,
+  }));
 }
 
 const cleanStr = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
@@ -349,11 +368,6 @@ export function mapFiscal(f) {
     dateBs: cleanStr(f.dateBs),
     dateAd: cleanStr(f.dateAd),
     taxable: typeof f.taxablePaisa === 'number' ? f.taxablePaisa / 100 : undefined,
-    payments: Array.isArray(f.payments)
-      ? f.payments.map((p) => ({
-          label: cleanStr(p.label) ?? '',
-          amount: typeof p.amountPaisa === 'number' ? p.amountPaisa / 100 : 0,
-        }))
-      : undefined,
+    payments: mapPayments(f.payments),
   };
 }

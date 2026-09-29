@@ -158,3 +158,18 @@ test('58mm (width 32) never overflows the column', () => {
   const txt = toText(renderTicket(kitchen), { width: 32 });
   for (const line of txt.split('\n')) assert.ok(line.length <= 32, `overflow: "${line}"`);
 });
+
+test('the plain slip keeps the legacy single-line payment when no tender list is given', () => {
+  const base = {
+    id: 'bill:s4', station: 'cashier', currency: 'Rs', number: 43, table: 'T2',
+    items: [{ name: 'Momo', qty: 1, amount: 100 }],
+    totals: { subtotal: 100, discount: 0, service: 0, tax: 0, total: 100 },
+  };
+  assert.match(toText(renderTicket(normalizeTicket({ ...base, payment: 'Cash' }))), /Paid\s+Cash/);
+  // A tender list wins over the legacy line — never both.
+  const both = toText(renderTicket(normalizeTicket({
+    ...base, payment: 'Cash', payments: [{ label: 'Khalti', amount: 100 }],
+  })));
+  assert.match(both, /Paid - Khalti\s+Rs 100\.00/);
+  assert.doesNotMatch(both, /Paid\s+Cash/);
+});
