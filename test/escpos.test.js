@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { encode } from '../src/core/render/escpos.js';
 import { DocBuilder } from '../src/core/render/doc.js';
+import { toText } from '../src/core/render/preview.js';
 
 test('encode starts with ESC @ init', () => {
   const buf = encode(new DocBuilder().text('hi').build());
@@ -31,4 +32,12 @@ test('bold wraps text in ESC E 1 / ESC E 0', () => {
 test('drawer emits the kick sequence', () => {
   const buf = encode(new DocBuilder().drawer().build());
   assert.ok(buf.includes(Buffer.from([0x1b, 0x70, 0x00])), 'ESC p 0 present');
+});
+
+test('the item table encodes to the same lines the preview shows, at the configured width', () => {
+  const doc = new DocBuilder().itemHead().item('Chicken Momo', 2, 'Rs 309.74', 'Rs 619.47').build();
+  for (const width of [48, 32]) {
+    const printed = encode(doc, { width, cut: false }).toString('latin1');
+    for (const l of toText(doc, { width }).split('\n')) assert.ok(printed.includes(`${l}\n`), `w=${width} missing "${l}"`);
+  }
 });

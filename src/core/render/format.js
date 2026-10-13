@@ -75,3 +75,72 @@ export function money(amount, currency = '') {
   const s = n.toFixed(2);
   return currency ? `${currency} ${s}` : s;
 }
+
+/**
+ * The item table — `Item | Qty | Rate | Amount`, the layout of a Nepali tax
+ * invoice (VAT Rules Schedule 5; snackk docs/INVOICE_FORMAT.md). The paper width
+ * decides the shape, so it lives here (encoder-side) and never in a layout:
+ *
+ *   wide (80mm, >= ITEM_TABLE_MIN_WIDTH cols) — the browser invoice's four
+ *     columns, number cells right-aligned, a long name wrapping in its own column;
+ *   narrow (58mm) — `2x Name ......... Amount` with `   @ Rate` beneath, because
+ *     four columns can't fit 32 characters legibly.
+ *
+ * A row whose cells don't fit their columns (a huge amount) falls back to the
+ * narrow shape for THAT row only — it never truncates a figure. Both encoders
+ * (ESC/POS and the text preview) render through these, so paper and preview
+ * cannot disagree.
+ */
+export const ITEM_TABLE_MIN_WIDTH = 40;
+
+// Fixed column widths for the wide table: "999", "Rs 99999.99", "Rs 999999.99".
+const QTY_W = 3;
+const RATE_W = 11;
+const AMOUNT_W = 12;
+const MIN_NAME_W = 8;
+
+const padLeft = (s, w) => ' '.repeat(Math.max(0, w - s.length)) + s;
+const padRight = (s, w) => s + ' '.repeat(Math.max(0, w - s.length));
+
+/** The name column's width at `w` total columns (<= 0 when the table can't fit). */
+const nameWidth = (w) => w - QTY_W - RATE_W - AMOUNT_W - 3;
+
+/**
+ * One item as printed lines.
+ * @param {{name:string, qty:string, rate:string, amount:string}} item  display strings
+ * @param {number} width
+ * @returns {string[]}
+ */
+export function itemLines(item, width) {
+  const w = columns(width);
+  const name = String(item.name ?? '');
+  const qty = String(item.qty ?? '');
+  const rate = String(item.rate ?? '');
+  const amount = String(item.amount ?? '');
+  const nw = nameWidth(w);
+  const fits = w >= ITEM_TABLE_MIN_WIDTH && nw >= MIN_NAME_W
+    && qty.length <= QTY_W && rate.length <= RATE_W && amount.length <= AMOUNT_W;
+
+  if (!fits) {
+    // `wrap` collapses leading whitespace, so the indent is kept by hand whenever
+    // the rate line fits (it always does at 32 cols; wrap is the total fallback).
+    const rateLine = `   @ ${rate}`;
+    return [...leftRight(`${qty}x ${name}`, amount, w), ...(rateLine.length <= w ? [rateLine] : wrap(rateLine, w))];
+  }
+  const nameLines = wrap(name, nw);
+  if (nameLines.length === 0) nameLines.push('');
+  const figures = ` ${padLeft(qty, QTY_W)} ${padLeft(rate, RATE_W)} ${padLeft(amount, AMOUNT_W)}`;
+  return nameLines.map((l, i) => (i === 0 ? padRight(l, nw) + figures : l));
+}
+
+/**
+ * The item table's header row, in the same shape `itemLines` uses at this width.
+ * @param {number} width
+ * @returns {string[]}
+ */
+export function itemHeader(width) {
+  const w = columns(width);
+  const nw = nameWidth(w);
+  if (w < ITEM_TABLE_MIN_WIDTH || nw < MIN_NAME_W) return leftRight('Item', 'Amount', w);
+  return [`${padRight('Item', nw)} ${padLeft('Qty', QTY_W)} ${padLeft('Rate', RATE_W)} ${padLeft('Amount', AMOUNT_W)}`];
+}

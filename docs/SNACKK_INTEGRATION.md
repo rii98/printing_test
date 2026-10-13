@@ -725,6 +725,36 @@ document banner, the fiscal meta block (`Invoice no.` / `Date (BS)` / `Date (AD)
 the local HTTP inbound, never for a snackk bill. When `fiscal` is absent (accounting
 off), the layout falls back to the plain settle slip (Bill # / time / totals).
 
+### 11.5c One bill format — lines before VAT (snackk `docs/INVOICE_FORMAT.md`)
+`src/inbound/snackk/map.js` (`billLine`, `issuerLines`, `discountLabelOf`, `mapFiscal`)
++ `src/core/render/layouts/bill.js` + `src/core/render/format.js` (`itemLines`, `itemHeader`).
+Every receipt prints in the layout of a Nepali tax invoice (VAT Rules Schedule 5),
+row-for-row like snackk's browser invoice:
+
+- **Item table.** When every line carries `unitPriceExVat` + `lineTotalExVat`
+  (snackk ≥ 6f5a067), the receipt prints `Item | Qty | Rate | Amount` — figures
+  BEFORE VAT, which snackk apportions to sum to `subtotal` exactly. The Doc op
+  `item` is width-agnostic; the ENCODER shapes it: four columns at ≥ 40 cols
+  (80mm), `2x Name … Amount` + `   @ Rate` on 58mm. A rate on every line.
+  Any line without the pair → the legacy `2x Name  amount` rows, unchanged.
+- **Seller block.** `restaurant.address` then `PAN …` under the name.
+- **Totals order.** Subtotal → Discount → Service charge → Taxable amount → VAT →
+  Total. Service charge sits above the taxable base because VAT is charged on it.
+  A tax document shows its Discount line even at zero. Labels follow snackk:
+  `Discount (10%)` / a reward's name, `Service charge (10%)`, `VAT (13%)`. The
+  plain slip prints `Taxable amount` when snackk sends `bill.taxable`.
+- **Buyer.** `fiscal.buyerName/buyerAddress/buyerPan` → a full TAX INVOICE prints
+  all three rows (blank when unknown — Schedule 5's slots); an abbreviated invoice
+  prints only what was given. An older snackk that sends no buyer keys never gets
+  blank slots.
+- **Note.** "Menu prices include 13% VAT." under the totals when the lines are
+  before VAT and the restaurant's prices include VAT.
+
+Not ported: snackk's "PROVISIONAL — NOT A TAX INVOICE" heading — `bill.print` only
+fires for settled bills, so the agent never prints an open tab. Known typography
+gap: the agent prints `Rs 1522.12` (no digit grouping) where the browser shows
+`Rs 1,522.12` — same figure, pre-existing `money()` formatting.
+
 ### 11.6 Boot ordering
 `src/index.js`. `app.listen` binds **before** the snackk agent starts (agent runs
 in the background), so the local HTTP inbound is never blocked by a slow cloud.

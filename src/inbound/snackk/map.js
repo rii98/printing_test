@@ -266,6 +266,46 @@ export function parseNpr(s) {
 }
 
 /**
+ * One snackk bill line → a neutral item. A snackk that sends the line BEFORE VAT
+ * (`lineTotalExVat` + `unitPriceExVat`, the tax invoice's figures — they sum to
+ * the bill's subtotal exactly) gets the `Item | Qty | Rate | Amount` table; an
+ * older one keeps the listed `lineTotal` and no rate, printing exactly as before.
+ * Both strings are required together: half a pair is treated as absent.
+ * @param {any} l  billLineDto
+ */
+function billLine(l) {
+  const exVat = typeof l.lineTotalExVat === 'string' && typeof l.unitPriceExVat === 'string';
+  return {
+    name: l.itemName,
+    qty: l.quantity,
+    amount: parseNpr(exVat ? l.lineTotalExVat : l.lineTotal),
+    rate: exVat ? parseNpr(l.unitPriceExVat) : undefined,
+    modifiers: Array.isArray(l.modifiers) && l.modifiers.length ? l.modifiers.map((m) => m.name) : undefined,
+  };
+}
+
+/** The seller block under the name: address (when set), then PAN. */
+function issuerLines(restaurant) {
+  const lines = [cleanStr(restaurant?.address), restaurant?.panNumber ? `PAN ${restaurant.panNumber}` : undefined]
+    .filter(Boolean);
+  return lines.length ? lines : undefined;
+}
+
+/**
+ * The discount row's label — snackk's own rule (billBreakdown.ts discountLabel):
+ * a reward's or audited discount's name, "Discount" without one, and a
+ * percentage's rate appended: "Friday Spin (20%)". Undefined when no discount
+ * applies, so the layout's zero-discount line on a tax invoice reads "Discount".
+ * @param {any} bill
+ */
+function discountLabelOf(bill) {
+  if (!(typeof bill.discountPaisa === 'number' && bill.discountPaisa > 0)) return undefined;
+  const base = cleanStr(bill.discountLabel) ?? 'Discount';
+  const pct = Number(bill.discountPct);
+  return bill.discountKind === 'percent' && Number.isFinite(pct) && pct > 0 ? `${base} (${pct}%)` : base;
+}
+
+/**
  * snackk BillDto → neutral cashier Ticket, for the settle-time receipt. The money
  * is PASSED THROUGH, never recomputed: exact integer paisa where snackk exposes
  * it (total, discount), the display strings parsed for the rest — snackk owns the
@@ -286,6 +326,9 @@ export function parseNpr(s) {
  */
 export function billToTicket(bill, { currency = 'Rs' } = {}) {
   const vatRate = Number(bill.vatRate);
+  const serviceRate = Number(bill.serviceChargeRate);
+  const items = (Array.isArray(bill.lines) ? bill.lines : []).map(billLine);
+  const linesExVat = items.length > 0 && items.every((it) => it.rate !== undefined);
   const copy = Number.isInteger(bill.copy) && bill.copy > 0 ? bill.copy : 0;
   return {
     id: `bill:${bill.sessionId}`,
@@ -305,13 +348,9 @@ export function billToTicket(bill, { currency = 'Rs' } = {}) {
     // The issuer identity rides WITH the bill — the receipt prints who the bill
     // says issued it, never a name configured on the box. (snackk billIssuerDto.)
     shopName: cleanStr(bill.restaurant?.name),
-    shopLines: bill.restaurant?.panNumber ? [`PAN ${bill.restaurant.panNumber}`] : undefined,
-    items: (Array.isArray(bill.lines) ? bill.lines : []).map((l) => ({
-      name: l.itemName,
-      qty: l.quantity,
-      amount: parseNpr(l.lineTotal),
-      modifiers: Array.isArray(l.modifiers) && l.modifiers.length ? l.modifiers.map((m) => m.name) : undefined,
-    })),
+    // Address then PAN under the name — the seller block of VAT Rules Schedules 5/6.
+    shopLines: issuerLines(bill.restaurant),
+    items,
     totals: {
       subtotal: parseNpr(bill.subtotal),
       // Exact paisa where snackk hands it over; the string parse is the fallback.
@@ -319,8 +358,18 @@ export function billToTicket(bill, { currency = 'Rs' } = {}) {
       service: parseNpr(bill.serviceCharge),
       tax: parseNpr(bill.vat),
       total: typeof bill.totalPaisa === 'number' ? bill.totalPaisa / 100 : parseNpr(bill.total),
+      // The VAT base, when this snackk sends it (the "Taxable amount" row).
+      taxable: typeof bill.taxable === 'string' ? parseNpr(bill.taxable) : undefined,
     },
     taxLabel: Number.isFinite(vatRate) && vatRate > 0 ? `VAT (${vatRate}%)` : undefined,
+    discountLabel: discountLabelOf(bill),
+    serviceLabel: Number.isFinite(serviceRate) && serviceRate > 0 ? `Service charge (${serviceRate}%)` : undefined,
+    // The line amounts are BEFORE VAT, so a VAT-inclusive menu's prices won't
+    // match them — say why, exactly as the browser invoice does. Only when the
+    // lines really are before VAT: an older snackk's lines ARE the menu prices.
+    notes: linesExVat && bill.pricesIncludeVat === true && Number.isFinite(vatRate) && vatRate > 0
+      ? [`Menu prices include ${vatRate}% VAT.`]
+      : undefined,
     // How the bill was paid (snackk billPaymentDto[]), for the PLAIN slip. Sent
     // for every settled bill, with or without snackk's Accounts; the fiscal
     // receipt prints its own tender split from `fiscal.payments` instead. An
@@ -369,5 +418,14 @@ export function mapFiscal(f) {
     dateAd: cleanStr(f.dateAd),
     taxable: typeof f.taxablePaisa === 'number' ? f.taxablePaisa / 100 : undefined,
     payments: mapPayments(f.payments),
+    buyer: {
+      name: cleanStr(f.buyerName),
+      address: cleanStr(f.buyerAddress),
+      pan: cleanStr(f.buyerPan),
+    },
+    // A full tax invoice prints Schedule 5's three buyer slots even when blank —
+    // but only when snackk actually SENT the buyer (an older server that never
+    // does must not print a real business buyer's invoice with empty slots).
+    buyerSlots: f.docType === 'tax_invoice' && 'buyerName' in f,
   };
 }

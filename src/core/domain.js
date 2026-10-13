@@ -14,6 +14,10 @@
  * @property {number} [amount]          Trusted line total (major units). When set, the bill layout prints
  *                                      it verbatim instead of computing qty×price — used when an upstream
  *                                      (snackk) owns the line math incl. modifiers/rounding.
+ * @property {number} [rate]            Trusted per-unit amount as PRINTED (major units). When every
+ *                                      line of a bill carries one, the bill prints the
+ *                                      `Item | Qty | Rate | Amount` table (a tax invoice's lines,
+ *                                      before VAT); otherwise the legacy `2x Name  amount` rows.
  * @property {string[]} [modifiers]     e.g. ["No onion", "Extra spicy"]
  * @property {string} [note]            Free text for the line.
  * @property {boolean} [voided]         A single line pulled before prep.
@@ -36,10 +40,15 @@
  * @property {string} [taxLabel]        e.g. "VAT 13%".
  * @property {number} [serviceCharge]   Positive number added.
  * @property {number} [total]           If given, trusted verbatim; else computed.
- * @property {{subtotal:number, discount:number, service:number, tax:number, total:number}} [totals]
- *                                      Trusted breakdown (major units). When set, the bill layout renders
+ * @property {{subtotal:number, discount:number, service:number, tax:number, total:number, taxable?:number}} [totals]
+ *                                      Trusted breakdown (major units). `taxable` (the VAT base) is
+ *                                      optional; when present the plain slip prints "Taxable amount"
+ *                                      above the tax, as the browser receipt does. When set, the bill layout renders
  *                                      these verbatim and does NOT recompute from item prices — for bills
  *                                      whose money an upstream owns (snackk: VAT-inclusive/promotions/udharo).
+ * @property {string} [discountLabel]   The discount row's label, e.g. "Friday Spin (20%)". Default "Discount".
+ * @property {string} [serviceLabel]    The service-charge row's label, e.g. "Service charge (10%)".
+ * @property {string[]} [notes]         Centered lines under the totals, e.g. "Menu prices include 13% VAT."
  * @property {string} [currency]        e.g. "Rs", "$". Default from config.
  * @property {string} [payment]         e.g. "Cash", "Card", "eSewa". Legacy single-line tender;
  *                                      `payments` wins when both are present.
@@ -65,6 +74,9 @@
  * @property {string} [dateAd]          Gregorian issue date.
  * @property {number} [taxable]         The VAT base (subtotal − discount + service), major units.
  * @property {FiscalPayment[]} [payments]  The tender split.
+ * @property {{name?:string, address?:string, pan?:string}} [buyer]  The document's buyer.
+ * @property {boolean} [buyerSlots]     Print all three buyer rows, blank when unknown — a full tax
+ *                                      invoice's Schedule-5 slots. False: print only what is given.
  * @property {string} [qr]              QR payload (URL, invoice ref…).
  * @property {boolean} [openDrawer]     Kick the cash drawer after a bill.
  */
@@ -104,6 +116,18 @@ function normalizePayments(raw) {
 }
 
 /**
+ * The document's buyer — each field optional, blanks dropped. Undefined when
+ * nothing usable is left, so the layout sees plain absence.
+ * @param {any} raw
+ * @returns {{name?:string, address?:string, pan?:string}|undefined}
+ */
+function normalizeBuyer(raw) {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const buyer = { name: cleanStr(raw.name), address: cleanStr(raw.address), pan: cleanStr(raw.pan) };
+  return Object.values(buyer).some((v) => v !== undefined) ? buyer : undefined;
+}
+
+/**
  * Tolerant normalizer for the OPTIONAL fiscal block on a cashier bill. Unlike the
  * core ticket fields, a malformed enrichment must NEVER reject the whole receipt —
  * a bill that can't carry its invoice number should still print as a plain slip.
@@ -122,6 +146,8 @@ function normalizeFiscal(raw) {
     dateAd: cleanStr(raw.dateAd),
     taxable: isFiniteNum(raw.taxable) ? Number(raw.taxable) : undefined,
     payments,
+    buyer: normalizeBuyer(raw.buyer),
+    buyerSlots: raw.buyerSlots === true ? true : undefined,
   };
   // Drop the block entirely if nothing survived — the layout treats absence as
   // "plain receipt", so an empty husk would just print a bare title-less slip.
@@ -152,11 +178,13 @@ export function normalizeTicket(raw) {
     if (!isFiniteNum(qty) || qty <= 0) throw new ValidationError(`items[${i}].qty must be a positive number`);
     if (it.price != null && (!isFiniteNum(it.price) || it.price < 0)) throw new ValidationError(`items[${i}].price must be >= 0`);
     if (it.amount != null && (!isFiniteNum(it.amount) || it.amount < 0)) throw new ValidationError(`items[${i}].amount must be a number >= 0`);
+    if (it.rate != null && (!isFiniteNum(it.rate) || it.rate < 0)) throw new ValidationError(`items[${i}].rate must be a number >= 0`);
     return {
       name: it.name.trim(),
       qty,
       price: it.price != null ? Number(it.price) : undefined,
       amount: it.amount != null ? Number(it.amount) : undefined,
+      rate: it.rate != null ? Number(it.rate) : undefined,
       modifiers: Array.isArray(it.modifiers) ? it.modifiers.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim()) : undefined,
       note: typeof it.note === 'string' && it.note.trim() ? it.note.trim() : undefined,
       voided: it.voided === true,
@@ -183,12 +211,16 @@ export function normalizeTicket(raw) {
     for (const f of ['subtotal', 'discount', 'service', 'tax', 'total']) {
       if (!isFiniteNum(raw.totals[f]) || raw.totals[f] < 0) throw new ValidationError(`ticket.totals.${f} must be a number >= 0`);
     }
+    // Optional sixth figure: validated the same way when present, never invented.
+    const taxable = raw.totals.taxable;
+    if (taxable != null && (!isFiniteNum(taxable) || taxable < 0)) throw new ValidationError('ticket.totals.taxable must be a number >= 0');
     totals = {
       subtotal: Number(raw.totals.subtotal),
       discount: Number(raw.totals.discount),
       service: Number(raw.totals.service),
       tax: Number(raw.totals.tax),
       total: Number(raw.totals.total),
+      taxable: taxable != null ? Number(taxable) : undefined,
     };
   }
 
@@ -210,6 +242,11 @@ export function normalizeTicket(raw) {
     serviceCharge: raw.serviceCharge != null ? Number(raw.serviceCharge) : undefined,
     total: raw.total != null ? Number(raw.total) : undefined,
     totals,
+    discountLabel: cleanStr(raw.discountLabel),
+    serviceLabel: cleanStr(raw.serviceLabel),
+    notes: Array.isArray(raw.notes)
+      ? raw.notes.filter((l) => typeof l === 'string' && l.trim()).map((l) => l.trim())
+      : undefined,
     currency: typeof raw.currency === 'string' ? raw.currency : undefined,
     payment: typeof raw.payment === 'string' ? raw.payment : undefined,
     payments: normalizePayments(raw.payments),

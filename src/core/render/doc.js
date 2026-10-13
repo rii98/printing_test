@@ -13,7 +13,12 @@
  * @typedef {{t:'qr',v:string}} OpQr
  * @typedef {{t:'cut'}} OpCut
  * @typedef {{t:'drawer'}} OpDrawer
- * @typedef {OpAlign|OpText|OpRule|OpRow|OpFeed|OpQr|OpCut|OpDrawer} Op
+ * @typedef {{t:'item',name:string,qty:string,rate:string,amount:string}} OpItem
+ *   One line of the `Item | Qty | Rate | Amount` table. Cells are display strings;
+ *   the ENCODER shapes them for its paper width (format.js itemLines), so a layout
+ *   stays width-agnostic.
+ * @typedef {{t:'itemHead'}} OpItemHead  The item table's column header.
+ * @typedef {OpAlign|OpText|OpRule|OpRow|OpFeed|OpQr|OpCut|OpDrawer|OpItem|OpItemHead} Op
  * @typedef {Op[]} Doc
  */
 
@@ -28,5 +33,10 @@ export class DocBuilder {
   qr(v) { this.ops.push({ t: 'qr', v: String(v) }); return this; }
   cut() { this.ops.push({ t: 'cut' }); return this; }
   drawer() { this.ops.push({ t: 'drawer' }); return this; }
+  item(name, qty, rate, amount) {
+    this.ops.push({ t: 'item', name: String(name), qty: String(qty), rate: String(rate), amount: String(amount) });
+    return this;
+  }
+  itemHead() { this.ops.push({ t: 'itemHead' }); return this; }
   build() { return this.ops; }
 }

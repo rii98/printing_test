@@ -7,7 +7,7 @@
  * @param {{width?:number}} [opts]
  * @returns {string}
  */
-import { rule, wrap, center, leftRight } from './format.js';
+import { rule, wrap, center, leftRight, itemLines, itemHeader } from './format.js';
 
 export function toText(doc, { width = 48 } = {}) {
   const lines = [];
@@ -30,6 +30,8 @@ export function toText(doc, { width = 48 } = {}) {
       case 'qr': put(`[QR: ${op.v}]`); break;
       case 'cut': lines.push('════════════ ✂ CUT ════════════'.slice(0, width)); break;
       case 'drawer': lines.push('[cash drawer kick]'); break;
+      case 'item': for (const l of itemLines(op, width)) put(l); break;
+      case 'itemHead': for (const l of itemHeader(width)) put(l); break;
     }
   }
   return lines.join('\n');

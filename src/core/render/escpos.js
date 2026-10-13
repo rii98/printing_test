@@ -4,7 +4,7 @@
  * the POS-8360 speaks. Text is encoded per the printer's active code page.
  */
 import { Buffer } from 'node:buffer';
-import { rule as ruleStr, wrap, center, leftRight } from './format.js';
+import { rule as ruleStr, wrap, center, leftRight, itemLines, itemHeader } from './format.js';
 
 const ESC = 0x1b, GS = 0x1d;
 const bytes = (...b) => Buffer.from(b);
@@ -76,6 +76,8 @@ export function encode(doc, { width = 48, encoding = 'latin1', cut = true, cutFe
       case 'qr': parts.push(ALIGN.center, qr(op.v), ALIGN.left); break;
       case 'cut': if (cut) parts.push(CUT(cutFeed)); break;
       case 'drawer': parts.push(DRAWER); break;
+      case 'item': for (const l of itemLines(op, width)) line(l); break;
+      case 'itemHead': for (const l of itemHeader(width)) line(l); break;
     }
   }
   return Buffer.concat(parts);

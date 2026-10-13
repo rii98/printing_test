@@ -55,6 +55,22 @@ export function computeTotals(t) {
 }
 
 /**
+ * The buyer rows of a tax document, in the browser invoice's labels. A full tax
+ * invoice (`buyerSlots`) prints all three of Schedule 5's slots, blank when
+ * unknown; anything else prints only what was given.
+ * @param {import('../../domain.js').Fiscal} fiscal
+ * @returns {[string, string][]}
+ */
+export function buyerRows(fiscal) {
+  const rows = /** @type {[string, string][]} */ ([
+    ['Buyer', fiscal.buyer?.name ?? ''],
+    ['Buyer address', fiscal.buyer?.address ?? ''],
+    ['Buyer PAN', fiscal.buyer?.pan ?? ''],
+  ]);
+  return fiscal.buyerSlots ? rows : rows.filter(([, value]) => value !== '');
+}
+
+/**
  * @param {import('../../domain.js').Ticket} t
  * @param {{shopName?:string, shopLines?:string[]}} [opts]  config branding — a
  *   FALLBACK only. A bill that carries its own `shopName`/`shopLines` (snackk's
@@ -75,20 +91,24 @@ export function billReceipt(t, opts = {}) {
   // A reprint is a copy of the receipt the guest already got at settle — mark it
   // plainly, mirroring the browser invoice's "Copy of Original – N". The number
   // shows only from the 2nd copy on (the 1st reprint is just "a copy").
-  if (t.copyOf) {
-    b.text(t.copyOf >= 2 ? `COPY OF ORIGINAL - ${t.copyOf}` : 'COPY OF ORIGINAL', { bold: true });
-  }
+  const copyBanner = t.copyOf
+    ? (t.copyOf >= 2 ? `COPY OF ORIGINAL - ${t.copyOf}` : 'COPY OF ORIGINAL')
+    : undefined;
 
   if (fiscal) {
-    // A legal tax-invoice receipt: banner + the fiscal meta block, matching the
-    // counter's browser invoice (Invoice no. / Date BS / Date AD / Table).
+    // A legal tax-invoice receipt: banner + the fiscal meta block, in the browser
+    // invoice's order (title, then the copy label, then Invoice no. / dates /
+    // Table / buyer) — snackk docs/INVOICE_FORMAT.md.
     if (fiscal.docTitle) b.text(fiscal.docTitle, { bold: true });
+    if (copyBanner) b.text(copyBanner, { bold: true });
     b.align('left');
     if (fiscal.invoiceNo) b.row('Invoice no.', fiscal.invoiceNo);
     if (fiscal.dateBs) b.row('Date (BS)', fiscal.dateBs);
     if (fiscal.dateAd) b.row('Date (AD)', fiscal.dateAd);
     if (t.table) b.row('Table', t.table);
+    for (const [label, value] of buyerRows(fiscal)) b.row(label, value);
   } else {
+    if (copyBanner) b.text(copyBanner, { bold: true });
     // The plain settle slip: bill number, table, and the settle time.
     if (t.number != null) b.text(`Bill #${t.number}`);
     if (t.table) b.text(`Table ${t.table}`);
@@ -97,32 +117,44 @@ export function billReceipt(t, opts = {}) {
   }
   b.rule('=');
 
-  for (const it of t.items) {
-    if (it.voided) continue;
+  const items = t.items.filter((it) => !it.voided);
+  // Every line carries its printed rate → the tax invoice's `Item | Qty | Rate |
+  // Amount` table (lines before VAT, summing to the Subtotal). Any line without
+  // one → the legacy rows, byte-identical to before, so an older upstream (or a
+  // hand-built ticket) never prints a half-filled table.
+  const table = items.length > 0 && items.every((it) => it.rate != null);
+  if (table) b.itemHead();
+  for (const it of items) {
     // A trusted line amount (upstream owns the line math, incl. modifiers) prints
     // verbatim; otherwise format the SAME rounded minor-unit value that fed the
     // subtotal, so the column of line totals always sums to the printed subtotal.
     const lineTotal = it.amount != null ? money(it.amount, cur) : money(fromMinor(lineMinor(it)), cur);
-    b.row(`${it.qty}x ${it.name}`, lineTotal);
+    if (table) b.item(it.name, it.qty, money(it.rate, cur), lineTotal);
+    else b.row(`${it.qty}x ${it.name}`, lineTotal);
     for (const m of it.modifiers ?? []) b.text(`   - ${m}`);
   }
   b.rule('-');
 
   b.row('Subtotal', money(subtotal, cur));
+  const discountLabel = (discount && t.discountLabel) || 'Discount';
   if (fiscal) {
-    // Fiscal parity with the browser: a plain (non-negative) discount line, the
-    // explicit taxable base, then VAT — the split a tax invoice must show.
-    if (discount) b.row('Discount', money(discount, cur));
-    const taxable = fiscal.taxable != null ? fiscal.taxable : Math.max(0, subtotal - discount);
+    // Fiscal parity with the browser invoice: the discount line even at zero (a
+    // legal document shows it), service charge ABOVE the taxable base because
+    // VAT is charged on it, then VAT — the split a tax invoice must show.
+    b.row(discountLabel, money(discount, cur));
+    if (service) b.row(t.serviceLabel ?? 'Service charge', money(service, cur));
+    const taxable = fiscal.taxable ?? t.totals?.taxable ?? Math.max(0, subtotal - discount) + service;
     b.row('Taxable amount', money(taxable, cur));
-    if (service) b.row('Service charge', money(service, cur));
     if (tax) b.row(t.taxLabel ?? 'VAT', money(tax, cur));
     b.rule('-');
     b.row('Total', money(total, cur), { bold: true });
     for (const p of fiscal.payments ?? []) b.row(`Paid - ${p.label}`, money(p.amount, cur));
   } else {
-    if (discount) b.row('Discount', `- ${money(discount, cur)}`);
-    if (service) b.row('Service', money(service, cur));
+    // The same rows, order and wording as the browser receipt — zero-value rows
+    // omitted (this slip is not a legal document that must show them).
+    if (discount) b.row(discountLabel, money(discount, cur));
+    if (service) b.row(t.serviceLabel ?? 'Service', money(service, cur));
+    if (tax && t.totals?.taxable != null) b.row('Taxable amount', money(t.totals.taxable, cur));
     if (tax) b.row(t.taxLabel ?? `Tax`, money(tax, cur));
     b.rule('-');
     b.row('TOTAL', money(total, cur), { bold: true, doubleH: true });
@@ -136,6 +168,11 @@ export function billReceipt(t, opts = {}) {
   }
 
   if (t.qr) b.feed(1).qr(t.qr);
+  // "Menu prices include 13% VAT." — why the lines read below the menu.
+  if (t.notes?.length) {
+    b.feed(1).align('center');
+    for (const n of t.notes) b.text(n);
+  }
   if (fiscal) {
     b.feed(1).align('center').text(`Printed on ${fmtNow()}`);
     b.text(t.footer ?? 'Thank you!');

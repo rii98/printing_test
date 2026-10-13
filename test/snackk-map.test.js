@@ -356,3 +356,146 @@ test('a malformed tender row is dropped, never fatal — the receipt still print
   assert.deepEqual(t.payments, [{ label: 'Cash', amount: 307.5 }]);
   assert.match(toText(renderTicket(t)), /Paid - Cash\s+Rs 307\.50/);
 });
+
+// ── tax-invoice format: lines before VAT, addresses, buyer (snackk 6f5a067) ─
+// The worked example from snackk docs/INVOICE_FORMAT.md, exactly as snackk's
+// bill.print emits it: 2× Momo @350, Tea @120, Thakali @900, VAT-inclusive —
+// gross Rs 1,720, taxable Rs 1,522.12. The browser invoice built from this same
+// payload is pinned in snackk src/console/billing/printDocument.test.ts.
+
+const exVatLine = (itemName, quantity, gross, rate, amount) => ({
+  itemName, quantity, station: 'kitchen', ticketNumber: 1, state: 'served', modifiers: [],
+  unitPrice: `Rs ${(gross / quantity).toFixed(2)}`, lineTotal: `Rs ${gross.toFixed(2)}`,
+  lineTotalPaisa: Math.round(gross * 100), unitPriceExVat: rate, lineTotalExVat: amount,
+});
+
+const invoiceBill = (over = {}) => billDto({
+  tableLabel: 'T4', billNumber: 57,
+  restaurant: { name: 'Alchemist Online', panNumber: '667677658', address: 'Jhamsikhel-3, Lalitpur' },
+  serviceChargeRate: '0.00', vatRate: '13.00', pricesIncludeVat: true,
+  lines: [
+    exVatLine('Chicken Momo', 2, 700, 'Rs 309.74', 'Rs 619.47'),
+    exVatLine('Masala Tea', 1, 120, 'Rs 106.19', 'Rs 106.19'),
+    exVatLine('Thakali Set', 1, 900, 'Rs 796.46', 'Rs 796.46'),
+  ],
+  itemsSubtotal: 'Rs 1,720.00', subtotal: 'Rs 1,522.12', discount: 'Rs 0.00', discountPaisa: 0,
+  discountKind: 'none', discountPct: null, discountLabel: null,
+  serviceCharge: 'Rs 0.00', taxable: 'Rs 1,522.12', vat: 'Rs 197.88', total: 'Rs 1,720.00', totalPaisa: 172000,
+  payments: [{ method: 'cash', label: 'Cash', amount: 'Rs 1,720.00', amountPaisa: 172000 }],
+  fiscal: {
+    docType: 'tax_invoice', displayNumber: '2083/84-000008', dateBs: '2083-06-27', dateAd: '2026-10-13',
+    taxablePaisa: 152212, payments: [{ label: 'Cash', amountPaisa: 172000 }],
+    buyerName: null, buyerPan: null, buyerAddress: null,
+  },
+  ...over,
+});
+
+test('lines before VAT map to rate + amount, summing to the subtotal', () => {
+  const t = normalizeTicket(billToTicket(invoiceBill()));
+  assert.deepEqual(t.items.map((i) => [i.qty, i.name, i.rate, i.amount]), [
+    [2, 'Chicken Momo', 309.74, 619.47],
+    [1, 'Masala Tea', 106.19, 106.19],
+    [1, 'Thakali Set', 796.46, 796.46],
+  ]);
+  const sum = t.items.reduce((s, i) => s + Math.round(i.amount * 100), 0);
+  assert.equal(sum, Math.round(t.totals.subtotal * 100));
+  assert.equal(t.totals.taxable, 1522.12);
+});
+
+test('the seller block is address then PAN; the menu-price note rides with VAT-inclusive bills', () => {
+  const t = normalizeTicket(billToTicket(invoiceBill()));
+  assert.deepEqual(t.shopLines, ['Jhamsikhel-3, Lalitpur', 'PAN 667677658']);
+  assert.deepEqual(t.notes, ['Menu prices include 13% VAT.']);
+  // Exclusive pricing: the lines ARE the menu prices — nothing to explain.
+  assert.equal(normalizeTicket(billToTicket(invoiceBill({ pricesIncludeVat: false }))).notes, undefined);
+});
+
+test('a full tax invoice asks for all three buyer slots; an abbreviated one does not', () => {
+  const full = normalizeTicket(billToTicket(invoiceBill()));
+  assert.equal(full.fiscal.buyerSlots, true);
+  assert.equal(full.fiscal.buyer, undefined); // nothing given — the slots print blank
+  const abbreviated = normalizeTicket(billToTicket(invoiceBill({ fiscal: { ...invoiceBill().fiscal, docType: 'abbreviated_invoice' } })));
+  assert.equal(abbreviated.fiscal.buyerSlots, undefined);
+  const named = normalizeTicket(billToTicket(invoiceBill({
+    fiscal: { ...invoiceBill().fiscal, buyerName: 'Ramesh Thapa', buyerPan: '123456789', buyerAddress: 'Baneshwor' },
+  })));
+  assert.deepEqual(named.fiscal.buyer, { name: 'Ramesh Thapa', address: 'Baneshwor', pan: '123456789' });
+});
+
+test('an older snackk that sends no buyer never prints empty buyer slots', () => {
+  // Pre-6f5a067 fiscal block: no buyer keys at all. A real business buyer may
+  // exist on that document — blank slots would misstate it.
+  const { buyerName: _n, buyerPan: _p, buyerAddress: _a, ...legacyFiscal } = invoiceBill().fiscal;
+  const t = normalizeTicket(billToTicket(invoiceBill({ fiscal: legacyFiscal })));
+  assert.equal(t.fiscal.buyerSlots, undefined);
+});
+
+test('an older snackk (no before-VAT figures) keeps the listed line totals and no rate', () => {
+  const t = normalizeTicket(billToTicket(billDto()));
+  assert.equal(t.items[0].amount, 265.49);
+  assert.equal(t.items[0].rate, undefined);
+  assert.equal(t.totals.taxable, undefined);
+  assert.deepEqual(t.shopLines, ['PAN 123456789']);
+  // Its lines ARE the menu prices (VAT-inclusive here) — no note explaining otherwise.
+  assert.equal(t.notes, undefined);
+  // Half a pair is treated as absent, never half-applied.
+  const half = billToTicket(billDto({ lines: [{ ...billDto().lines[0], lineTotalExVat: 'Rs 200.00' }] }));
+  assert.equal(half.items[0].rate, undefined);
+  assert.equal(half.items[0].amount, 265.49);
+});
+
+test('discount and service-charge labels follow snackk\'s own wording', () => {
+  const t = billToTicket(invoiceBill({
+    serviceChargeRate: '10.00', discountPaisa: 15221, discountKind: 'percent', discountPct: '10.00', discountLabel: 'Friday Spin',
+  }));
+  assert.equal(t.discountLabel, 'Friday Spin (10%)');
+  assert.equal(t.serviceLabel, 'Service charge (10%)');
+  // No discount → no label; the tax invoice's zero row then reads plain "Discount".
+  assert.equal(billToTicket(invoiceBill()).discountLabel, undefined);
+  assert.equal(billToTicket(invoiceBill({ discountPaisa: 500, discountKind: 'amount' })).discountLabel, 'Discount');
+});
+
+test('PARITY: the thermal TAX INVOICE reads row-for-row like the browser invoice', () => {
+  // The browser invoice for this payload (snackk printDocument.test.ts), as
+  // label/value pairs in print order. The thermal receipt must print the same
+  // pairs in the same order — only its typography may differ.
+  const browser = [
+    ['Invoice no.', '2083/84-000008'],
+    ['Date (BS)', '2083-06-27'],
+    ['Date (AD)', '2026-10-13'],
+    ['Table', 'T4'],
+    ['Buyer', ''],
+    ['Buyer address', ''],
+    ['Buyer PAN', ''],
+    ['Chicken Momo', '2 Rs 309.74 Rs 619.47'],
+    ['Masala Tea', '1 Rs 106.19 Rs 106.19'],
+    ['Thakali Set', '1 Rs 796.46 Rs 796.46'],
+    ['Subtotal', 'Rs 1522.12'],
+    ['Discount', 'Rs 0.00'],
+    ['Taxable amount', 'Rs 1522.12'],
+    ['VAT (13%)', 'Rs 197.88'],
+    ['Total', 'Rs 1720.00'],
+    ['Paid - Cash', 'Rs 1720.00'],
+  ];
+  const txt = toText(renderTicket(normalizeTicket(billToTicket(invoiceBill()))), { width: 48 });
+  const lines = txt.split('\n');
+  let at = 0;
+  for (const [label, value] of browser) {
+    const re = new RegExp(`^${label.replace(/[.()]/g, '\\$&')}\\s*${value.replace(/[.()]/g, '\\$&').replace(/ /g, '\\s+')}\\s*$`, 'i');
+    const found = lines.findIndex((l, i) => i >= at && re.test(l.trim()));
+    assert.ok(found >= 0, `"${label} ${value}" missing or out of order:\n${txt}`);
+    at = found + 1;
+  }
+  // The header block and notes, in order, above and below.
+  assert.ok(txt.indexOf('Jhamsikhel-3, Lalitpur') < txt.indexOf('PAN 667677658'));
+  assert.ok(txt.indexOf('PAN 667677658') < txt.indexOf('TAX INVOICE'));
+  assert.ok(txt.indexOf('Paid - Cash') < txt.indexOf('Menu prices include 13% VAT.'));
+  assert.ok(txt.indexOf('Menu prices include 13% VAT.') < txt.indexOf('Printed on'));
+});
+
+test('58mm: the whole tax invoice fits the roll and still reconciles', () => {
+  const txt = toText(renderTicket(normalizeTicket(billToTicket(invoiceBill()))), { width: 32 });
+  for (const line of txt.split('\n')) assert.ok(line.length <= 32, `overflow: "${line}"`);
+  assert.match(txt, /2x Chicken Momo\s+Rs 619\.47\n {3}@ Rs 309\.74/);
+  assert.match(txt, /1x Masala Tea\s+Rs 106\.19\n {3}@ Rs 106\.19/); // rate on EVERY line
+});

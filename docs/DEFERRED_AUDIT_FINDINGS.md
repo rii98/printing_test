@@ -15,7 +15,7 @@ each repo root: `printing_test/` = the on-prem print agent, `snackk/` = the clou
 | ID | Sev | One-line | Fix lives in |
 |----|-----|----------|--------------|
 | [A1](#a1--med--merged-tab-can-print-a-duplicate-receipt) | MED | Merged tab settled via a non-primary session prints the receipt twice | `printing_test/src/inbound/snackk/map.js` |
-| [A2](#a2--med--vat-inclusive-receipts-dont-reconcile) | MED | VAT-inclusive receipt: line items don't sum to the printed subtotal | `printing_test/src/inbound/snackk/map.js` + `src/core/render/layouts/bill.js` |
+| [A2](#a2--med--vat-inclusive-receipts-dont-reconcile) | ~~MED~~ **RESOLVED** | VAT-inclusive receipt: line items don't sum to the printed subtotal | fixed on `feat/invoice-line-format` (see A2) |
 | [A3](#a3--med--print-and-both-are-behaviourally-identical) | MED | `print` mode does not disable the KDS (doc corrected; code deferred) | `snackk/server/routes/stream.ts` + KDS console |
 | [A4](#a4--med-efficiency--reconcile-re-scans-the-full-12h-window-every-90s) | MED | Bill/void recovery re-scans the full 12h window every 90s (N+1) | `printing_test/src/inbound/snackk/subscribe.js` + `snackk/server/billing/bill.ts` |
 | [A5](#a5--low--agent-treats-feature-disabled-404-like-a-transient-error) | LOW | Disabled tenant keeps a stale cached `stationDelivery` on `/health` | `printing_test/src/inbound/snackk/config.js` |
@@ -55,6 +55,16 @@ regression test (settle a non-primary member → recovery must dedupe).
 ---
 
 ## A2 · MED · VAT-inclusive receipts don't reconcile
+
+> **RESOLVED (2026-10-13, `feat/invoice-line-format`).** Fixed at the root rather
+> than with the "Item total (incl VAT)" bridge proposed below: snackk (commit
+> 6f5a067) now sends every line BEFORE VAT (`unitPriceExVat` / `lineTotalExVat`,
+> apportioned so they sum to `subtotal` exactly), and the agent prints them in a
+> tax invoice's `Item | Qty | Rate | Amount` table — Nepal VAT Rules Schedule 5,
+> one format for every receipt (snackk `docs/INVOICE_FORMAT.md`). An older snackk
+> that sends no before-VAT figures still prints its listed totals as before.
+> Pinned by `test/snackk-map.test.js` (lines sum to subtotal; PARITY with the
+> browser invoice) and `test/format.test.js` (item table at 80mm/58mm).
 
 **What.** For `pricesIncludeVat = true` tenants the agent prints **gross**
 per-line amounts (`parseNpr(l.lineTotal)`) but a **net** "Subtotal"

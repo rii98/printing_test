@@ -173,3 +173,76 @@ test('the plain slip keeps the legacy single-line payment when no tender list is
   assert.match(both, /Paid - Khalti\s+Rs 100\.00/);
   assert.doesNotMatch(both, /Paid\s+Cash/);
 });
+
+// ── tax-invoice format (snackk docs/INVOICE_FORMAT.md) ──────────────────────
+
+const fiscalBase = {
+  id: 'bill:f1', station: 'cashier', currency: 'Rs', table: 'T4',
+  items: [{ name: 'Momo', qty: 2, rate: 300, amount: 600 }],
+  totals: { subtotal: 600, discount: 0, service: 60, tax: 85.8, total: 745.8, taxable: 660 },
+  taxLabel: 'VAT (13%)', serviceLabel: 'Service charge (10%)',
+  fiscal: { docTitle: 'TAX INVOICE', invoiceNo: '2083/84-000001', taxable: 660 },
+};
+const order = (txt, labels) => labels.map((l) => txt.search(new RegExp(l, 'i')));
+
+test('a tax invoice prints service charge ABOVE the taxable amount it is part of', () => {
+  const txt = toText(renderTicket(normalizeTicket(fiscalBase)));
+  const [sc, taxable, vat] = order(txt, ['Service charge \\(10%\\)', 'Taxable amount', 'VAT \\(13%\\)']);
+  assert.ok(sc >= 0 && sc < taxable && taxable < vat, txt);
+  assert.match(txt, /Taxable amount\s+Rs 660\.00/);
+});
+
+test('a tax invoice shows its discount line even at zero', () => {
+  assert.match(toText(renderTicket(normalizeTicket(fiscalBase))), /Discount\s+Rs 0\.00/);
+});
+
+test('a copy banner follows the document title, as on the browser invoice', () => {
+  const txt = toText(renderTicket(normalizeTicket({ ...fiscalBase, copyOf: 2 })));
+  assert.ok(txt.indexOf('TAX INVOICE') < txt.indexOf('COPY OF ORIGINAL - 2'));
+});
+
+test('buyer rows: full tax invoice prints all three slots; abbreviated only what was given', () => {
+  const full = toText(renderTicket(normalizeTicket({
+    ...fiscalBase, fiscal: { ...fiscalBase.fiscal, buyerSlots: true, buyer: { name: 'Ramesh Thapa' } },
+  })));
+  assert.match(full, /Buyer\s+Ramesh Thapa/);
+  assert.match(full, /^Buyer address\s*$/m);
+  assert.match(full, /^Buyer PAN\s*$/m);
+  const abbreviated = toText(renderTicket(normalizeTicket({
+    ...fiscalBase, fiscal: { ...fiscalBase.fiscal, docTitle: 'ABBREVIATED TAX INVOICE', buyer: { name: 'Sita' } },
+  })));
+  assert.match(abbreviated, /Buyer\s+Sita/);
+  assert.doesNotMatch(abbreviated, /Buyer (address|PAN)/);
+});
+
+test('the plain slip mirrors the browser receipt: taxable row, plain discount, the note', () => {
+  const txt = toText(renderTicket(normalizeTicket({
+    id: 'bill:p9', station: 'cashier', currency: 'Rs', number: 57, table: 'T4',
+    items: [{ name: 'Momo', qty: 2, rate: 300, amount: 600 }],
+    totals: { subtotal: 600, discount: 60, service: 0, tax: 70.2, total: 610.2, taxable: 540 },
+    taxLabel: 'VAT (13%)', discountLabel: 'Friday Spin (10%)', notes: ['Menu prices include 13% VAT.'],
+  })));
+  assert.match(txt, /Item\s+Qty\s+Rate\s+Amount/);
+  assert.match(txt, /Momo\s+2\s+Rs 300\.00\s+Rs 600\.00/);
+  assert.match(txt, /Friday Spin \(10%\)\s+Rs 60\.00/);
+  assert.match(txt, /Taxable amount\s+Rs 540\.00/);
+  assert.match(txt, /Menu prices include 13% VAT\./);
+});
+
+test('a ticket with any line lacking a rate keeps the legacy item rows (no half table)', () => {
+  const txt = toText(renderTicket(normalizeTicket({
+    id: 'bill:l1', station: 'cashier', currency: 'Rs',
+    items: [{ name: 'Momo', qty: 2, rate: 300, amount: 600 }, { name: 'Tea', qty: 1, amount: 50 }],
+    totals: { subtotal: 650, discount: 0, service: 0, tax: 0, total: 650 },
+  })));
+  assert.doesNotMatch(txt, /Item\s+Qty/);
+  assert.match(txt, /2x Momo\s+Rs 600\.00/);
+});
+
+test('a negative or garbage rate is rejected like any other money field', () => {
+  assert.throws(() => normalizeTicket({ id: 'x', station: 'cashier', items: [{ name: 'a', rate: -1 }] }), /items\[0\]\.rate/);
+  assert.throws(() => normalizeTicket({
+    id: 'x', station: 'cashier', items: [{ name: 'a', amount: 1 }],
+    totals: { subtotal: 1, discount: 0, service: 0, tax: 0, total: 1, taxable: 'x' },
+  }), /totals\.taxable/);
+});
