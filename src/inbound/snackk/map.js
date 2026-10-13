@@ -320,6 +320,11 @@ function discountLabelOf(bill) {
  * a distinct key that prints once — where a bare re-emit at copy 0 would be
  * dropped as a duplicate of the original. Absent/invalid copy ⇒ 0 (an older
  * server that never sends `copy` still prints its one receipt).
+ *
+ * The copy's LABEL is snackk's (`copyLabel`, e.g. "Copy of Original (1)") and is
+ * printed verbatim — snackk counts every print of the document, the settle-time
+ * original included, so only it knows which copy this is. A server too old to
+ * send the field falls back to its copy number.
  * @param {import('./types').BillDto} bill
  * @param {{currency?:string}} [opts]
  * @returns {import('../../core/domain.js').Ticket}
@@ -333,10 +338,11 @@ export function billToTicket(bill, { currency = 'Rs' } = {}) {
   return {
     id: `bill:${bill.sessionId}`,
     revision: copy,
-    // A reprint is a COPY by definition (the guest already has the settle
-    // receipt), so any copy > 0 is banner-worthy — independent of the browser's
-    // own "Copy of Original – N" threshold.
-    copyOf: copy > 0 ? copy : undefined,
+    // Present (even null, for the original) ⇒ snackk decided it; absent ⇒ an
+    // older server, whose copy number is the reprint count.
+    ...('copyLabel' in bill
+      ? { copyLabel: typeof bill.copyLabel === 'string' ? bill.copyLabel : undefined }
+      : { copyOf: copy > 0 ? copy : undefined }),
     number: bill.billNumber ?? undefined,
     station: 'cashier',
     // Same table identity every other slip shows (see tableDisplay): a label is

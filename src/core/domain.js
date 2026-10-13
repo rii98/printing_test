@@ -59,8 +59,12 @@
  *                                      can't be handed the wrong one (falls back to config branding).
  * @property {string[]} [shopLines]     Sub-header lines under the name (e.g. "PAN 123456789").
  * @property {Fiscal} [fiscal]          Legal-document facts for a tax-invoice receipt (see below).
- * @property {number} [copyOf]          A reprint's copy number (>0). Prints a "COPY OF ORIGINAL"
- *                                      banner; distinct from the original settle print (copy 0).
+ * @property {string} [copyLabel]       What a reprint prints above its meta rows, verbatim — e.g.
+ *                                      "Copy of Original (1)". Absent on the original. IRD's
+ *                                      e-billing procedure (clause 4(च)) wants every copy to say
+ *                                      it is one AND which; snackk decides the text.
+ * @property {number} [copyOf]          LEGACY input only: a reprint's copy number from a source
+ *                                      that doesn't send `copyLabel`. Normalised into copyLabel.
  * @property {string} [footer]
  *
  * @typedef {Object} FiscalPayment
@@ -98,6 +102,13 @@ export class ValidationError extends Error {
 const isFiniteNum = (v) => typeof v === 'number' && Number.isFinite(v);
 const isNonNegInt = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
 const cleanStr = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+/**
+ * "Copy of Original (N)" for a source that sends only a copy number — the
+ * format of IRD's own samples ("Copy of Original(1)", "(2)"), numbered from the
+ * first reprint. Anything but a positive integer is the original: no label.
+ */
+const legacyCopyLabel = (copyOf) =>
+  isNonNegInt(copyOf) && copyOf > 0 ? `Copy of Original (${copyOf})` : undefined;
 
 /**
  * Tolerant normalizer for a tender list (the plain slip's `payments` and the
@@ -255,11 +266,11 @@ export function normalizeTicket(raw) {
       ? raw.shopLines.filter((l) => typeof l === 'string' && l.trim()).map((l) => l.trim())
       : undefined,
     fiscal: normalizeFiscal(raw.fiscal),
-    // A reprint's copy number, for the "COPY OF ORIGINAL" banner. Cosmetic and
-    // lenient — a bad value is dropped, never fatal (the idempotency key rides
-    // `revision`, which is validated strictly above). Only a positive integer is
-    // a copy; 0/absent is the original.
-    copyOf: isNonNegInt(raw.copyOf) && raw.copyOf > 0 ? raw.copyOf : undefined,
+    // A reprint's label, printed verbatim. Cosmetic and lenient — a bad value is
+    // dropped, never fatal (the idempotency key rides `revision`, validated
+    // strictly above). A source that still sends only a copy number gets the
+    // IRD-shaped label from it; 0/absent is the original — no label.
+    copyLabel: cleanStr(raw.copyLabel) ?? legacyCopyLabel(raw.copyOf),
     footer: typeof raw.footer === 'string' ? raw.footer : undefined,
     qr: typeof raw.qr === 'string' ? raw.qr : undefined,
     openDrawer: raw.openDrawer === true,

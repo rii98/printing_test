@@ -88,12 +88,10 @@ export function billReceipt(t, opts = {}) {
   b.align('center').text(shopName, { bold: true, doubleH: true });
   for (const l of shopLines) b.text(l);
 
-  // A reprint is a copy of the receipt the guest already got at settle — mark it
-  // plainly, mirroring the browser invoice's "Copy of Original – N". The number
-  // shows only from the 2nd copy on (the 1st reprint is just "a copy").
-  const copyBanner = t.copyOf
-    ? (t.copyOf >= 2 ? `COPY OF ORIGINAL - ${t.copyOf}` : 'COPY OF ORIGINAL')
-    : undefined;
+  // A reprint says it is a copy and which one — "Copy of Original (1)" — in the
+  // exact words snackk decided, the same text its browser invoice prints. The
+  // agent never numbers copies itself: the count lives with the document.
+  const copyBanner = t.copyLabel;
 
   if (fiscal) {
     // A legal tax-invoice receipt: banner + the fiscal meta block, in the browser

@@ -108,20 +108,32 @@ test('a fiscal bill prints the full tax-invoice layout, matching the browser', (
   assert.doesNotMatch(txt, /NAMASTE MINI MARKET/);
 });
 
-test('a reprint prints a COPY OF ORIGINAL banner; the original prints none', () => {
+test('a reprint prints its copy label verbatim; the original prints none', () => {
   const base = {
     id: 'bill:s3', station: 'cashier', currency: 'Rs', number: 42, table: 'T7',
     items: [{ name: 'Momo', qty: 1, amount: 100 }],
     totals: { subtotal: 100, discount: 0, service: 0, tax: 0, total: 100 },
   };
-  // Original (copy 0) — no banner.
-  assert.doesNotMatch(toText(renderTicket(normalizeTicket(base))), /COPY OF ORIGINAL/);
-  // First reprint — the banner, unnumbered (it's simply "a copy").
-  const c1 = toText(renderTicket(normalizeTicket({ ...base, copyOf: 1 })));
-  assert.match(c1, /COPY OF ORIGINAL/);
-  assert.doesNotMatch(c1, /COPY OF ORIGINAL - /);
-  // Second copy on — numbered.
-  assert.match(toText(renderTicket(normalizeTicket({ ...base, copyOf: 3 }))), /COPY OF ORIGINAL - 3/);
+  // Original — no banner.
+  assert.doesNotMatch(toText(renderTicket(normalizeTicket(base))), /Copy of Original/i);
+  // The label snackk decided prints exactly as given (IRD: "Copy of Original(1)").
+  const c1 = toText(renderTicket(normalizeTicket({ ...base, copyLabel: 'Copy of Original (1)' })));
+  // Bold lines print in the receipt's heading case — same words, same number.
+  assert.match(c1, /Copy of Original \(1\)/i);
+});
+
+test('a source sending only a copy number still gets a NUMBERED copy label — never a bare "copy"', () => {
+  // IRD clause 4(च): every copy states which it is. The first reprint is (1).
+  const base = {
+    id: 'bill:s4', station: 'cashier', number: 7,
+    items: [{ name: 'Momo', qty: 1, amount: 100 }],
+    totals: { subtotal: 100, discount: 0, service: 0, tax: 0, total: 100 },
+  };
+  assert.equal(normalizeTicket({ ...base, copyOf: 1 }).copyLabel, 'Copy of Original (1)');
+  assert.equal(normalizeTicket({ ...base, copyOf: 3 }).copyLabel, 'Copy of Original (3)');
+  assert.equal(normalizeTicket({ ...base, copyOf: 0 }).copyLabel, undefined);
+  // An explicit label always wins over a number.
+  assert.equal(normalizeTicket({ ...base, copyOf: 3, copyLabel: 'Copy of Original (2)' }).copyLabel, 'Copy of Original (2)');
 });
 
 test('a partial/garbage trusted totals block is rejected whole (never half-prints)', () => {
@@ -197,8 +209,9 @@ test('a tax invoice shows its discount line even at zero', () => {
 });
 
 test('a copy banner follows the document title, as on the browser invoice', () => {
-  const txt = toText(renderTicket(normalizeTicket({ ...fiscalBase, copyOf: 2 })));
-  assert.ok(txt.indexOf('TAX INVOICE') < txt.indexOf('COPY OF ORIGINAL - 2'));
+  const txt = toText(renderTicket(normalizeTicket({ ...fiscalBase, copyLabel: 'Copy of Original (2)' })));
+  const at = txt.toUpperCase().indexOf('COPY OF ORIGINAL (2)');
+  assert.ok(at > 0 && txt.indexOf('TAX INVOICE') < at, txt);
 });
 
 test('buyer rows: full tax invoice prints all three slots; abbreviated only what was given', () => {

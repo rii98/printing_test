@@ -255,6 +255,22 @@ test('a reprint copy becomes the revision → a DISTINCT idempotency key', () =>
   assert.equal(c2.copyOf, 2);
 });
 
+test("snackk's copy label rides through verbatim; the original carries none", () => {
+  // A current snackk always sends `copyLabel` — null on the settle original.
+  const original = normalizeTicket(billToTicket(billDto({ copy: 0, copyLabel: null })));
+  assert.equal(original.copyLabel, undefined);
+  // The label snackk decided is what prints — never re-derived from `copy`
+  // (here the POS reprint is print 3, i.e. the second copy).
+  const reprint = normalizeTicket(billToTicket(billDto({ copy: 3, copyLabel: 'Copy of Original (2)' })));
+  assert.equal(reprint.revision, 3);
+  assert.equal(reprint.copyLabel, 'Copy of Original (2)');
+});
+
+test('an older snackk without copyLabel falls back to its reprint count, numbered', () => {
+  const legacy = normalizeTicket(billToTicket(billDto({ copy: 2 })));
+  assert.equal(legacy.copyLabel, 'Copy of Original (2)');
+});
+
 test('a non-integer or negative copy is treated as the original (copy 0)', () => {
   // Defensive: only a positive integer bumps the revision; anything else is @0.
   assert.equal(billToTicket(billDto({ copy: -1 })).revision, 0);
