@@ -23,7 +23,7 @@ export function kitchenTicket(t, { banner = 'KITCHEN ORDER' } = {}) {
   b.align('left');
   if (t.number != null) b.row('Ticket', `#${t.number}`, { bold: true });
   if (t.table) b.row('Table', t.table, { bold: true });
-  if (t.server) b.row('Server', t.server);
+  if (t.server) b.row('Waiter', t.server);
   if (t.placedAt) b.row('Time', fmtTime(t.placedAt));
   b.rule('-');
 

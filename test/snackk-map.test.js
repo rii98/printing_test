@@ -69,6 +69,19 @@ test('maps the core ticket fields through unchanged', () => {
   assert.equal(t.voided, false);
 });
 
+test('the KOT/BOT names the waiter who took the order, and omits the row when none did', () => {
+  const kot = (over) => toText(renderTicket(orderTicketToTicket(dto(over))));
+  assert.equal(orderTicketToTicket(dto({ waiterName: 'Sita Gurung' })).server, 'Sita Gurung');
+  assert.match(kot({ waiterName: 'Sita Gurung' }), /Waiter\s+Sita Gurung/i);
+  const bot = kot({ station: 'bar', waiterName: 'Sita Gurung' });
+  assert.match(bot, /BAR ORDER/i);
+  assert.match(bot, /Waiter\s+Sita Gurung/i);
+  // A guest order fired direct (null) and an older server (field absent) alike.
+  assert.equal(orderTicketToTicket(dto({ waiterName: null })).server, undefined);
+  assert.doesNotMatch(kot({ waiterName: null }), /Waiter/i);
+  assert.doesNotMatch(kot({}), /Waiter/i);
+});
+
 test('a zone qualifies the table name; no zone leaves the bare label', () => {
   // snackk allows the same label in two zones, so the slip must name the zone to
   // keep them apart on the pass.

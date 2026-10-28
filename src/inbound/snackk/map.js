@@ -106,6 +106,9 @@ export function orderTicketToTicket(dto) {
     voided,
   };
   if (voided && dto.voidReason) ticket.voidReason = dto.voidReason;
+  // Who took the order (snackk `waiterName`, null for a guest order fired direct,
+  // absent from an older server): the KOT/BOT prints it, or omits the row.
+  if (dto.waiterName) ticket.server = dto.waiterName;
   return ticket;
 }
 
