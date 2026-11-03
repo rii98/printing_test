@@ -124,6 +124,39 @@ still won't start.
 > noise (LocalService/LocalSystem can't write the Event Log). Ignore them — look for the
 > real `throw err;` / `Error:` block instead.
 
+### E. Service never gets created — `OpenService FAILED 1060` / "The service name is invalid"
+**Symptoms:** `npm run setup` prints `Installing service "PM2" ... Complete`, then loops on
+`Attempt #N to locate "pm2.exe" service..`. Afterwards `sc query state= all | findstr /i pm2`
+finds nothing, `sc config pm2.exe ...` fails with **1060**, and `net start pm2.exe` says
+**"The service name is invalid"**. (Seen on Windows 10 build 19045, Nov 2026.)
+
+**Cause:** the service files were copied to `C:\ProgramData\pm2\service\daemon\` (`pm2.exe`,
+`pm2.exe.config`, `pm2.xml`), but registering the service failed silently: the
+`<serviceaccount>` block that pm2-installer wrote into `pm2.xml` is rejected by Windows.
+Running the installer by hand shows the real error:
+```cmd
+cd C:\ProgramData\pm2\service\daemon
+pm2.exe install
+:: -> WMI.WmiException: StatusInvalidServiceAccount
+```
+
+**Fix:** delete the account from `pm2.xml` so the service defaults to **LocalSystem** (which is
+what fix #2 wants anyway), then register it by hand:
+```cmd
+notepad C:\ProgramData\pm2\service\daemon\pm2.xml
+::   delete everything from <serviceaccount> to </serviceaccount> (inclusive), save
+cd C:\ProgramData\pm2\service\daemon
+pm2.exe install                 :: the daemon's own pm2.exe (winsw), NOT the pm2 CLI
+sc qc pm2.exe                   :: SERVICE_START_NAME : LocalSystem, AUTO_START
+net start pm2.exe
+sc query pm2.exe                :: RUNNING
+```
+Then continue with step 6 (`pm2 start ecosystem.config.cjs`, `pm2 save`) from a fresh
+Administrator prompt.
+
+> Tip: if the setup window's title starts with **"Select"**, someone clicked into it and
+> QuickEdit mode has paused the process — press **Esc** to resume.
+
 ---
 
 ## Fallback if the service refuses to cooperate
